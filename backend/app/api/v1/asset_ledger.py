@@ -7,7 +7,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import require_perm
 from app.core.database import get_db
 from app.core.response import ok
-from app.schemas.asset import AssetBatchUpdate, AssetCreate, AssetUpdate
+from app.schemas.asset import (
+    AssetBatchUpdate,
+    AssetCreate,
+    AssetStockInPayload,
+    AssetUpdate,
+)
 from app.services.asset_service import AssetService
 from app.services.permission_service import AuthContext
 
@@ -138,6 +143,17 @@ async def update_asset(
 ):
     result = await AssetService(session).update(asset_id, payload, context)
     return ok(result.model_dump(mode="json"), message="资产已更新")
+
+
+@router.post("/assets/{asset_id}/stock-in", summary="资产确认入库")
+async def stock_in_asset(
+    asset_id: int,
+    payload: AssetStockInPayload,
+    context: AuthContext = Depends(require_perm("asset:inbound:confirm")),
+    session: AsyncSession = Depends(get_db),
+):
+    result = await AssetService(session).stock_in(asset_id, payload, context)
+    return ok(result.model_dump(mode="json"), message="资产已入库")
 
 
 @router.delete("/assets/{asset_id}", summary="删除资产")

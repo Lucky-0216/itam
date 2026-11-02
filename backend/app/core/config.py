@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     DEFAULT_ADMIN_USERNAME: str = "admin"
     DEFAULT_ADMIN_PASSWORD: str = ""
     DEFAULT_ADMIN_NAME: str = "系统管理员"
+    DEFAULT_USER_PASSWORD: str = ""
     UPLOAD_DIR: str = "/app/uploads"
     ASSET_NO_PREFIX: str = "ITAM"
     ASSET_NO_PATTERN: str = "{prefix}-{year}{month}-{seq:04d}"

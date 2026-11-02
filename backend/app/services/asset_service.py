@@ -26,6 +26,7 @@ from app.models import (
     AssetAttachment,
     AssetCategory,
     AssetCategoryField,
+    AssetHistory,
     AssetInbound,
     AssetInboundCode,
     AssetModel,
@@ -45,11 +46,13 @@ from app.schemas.asset import (
     AssetCreate,
     AssetOut,
     AssetPageOut,
+    AssetStockInPayload,
     AssetTimelineItem,
     AssetUpdate,
     CustodianOptionOut,
     DeptOptionOut,
 )
+from app.services.asset_snapshot import asset_snapshot
 from app.services.audit_service import AuditService
 from app.services.permission_service import AuthContext
 from app.services.scope_service import asset_scope_conditions, is_self_only, scoped_dept_ids
@@ -399,16 +402,36 @@ class AssetService:
             )
         return conditions
 
-    async def _get_accessible(self, asset_id: int, context: AuthContext) -> Asset:
-        asset = await self.assets.get_detail(asset_id)
-        if asset is None:
-            raise NotFoundError("资产不存在")
+    async def _assert_asset_accessible(
+        self, asset: Asset, context: AuthContext
+    ) -> None:
         allowed = await scoped_dept_ids(self.session, context)
         if is_self_only(context):
             if asset.custodian_id != context.user.id:
                 raise NotFoundError("资产不存在或无权访问")
         elif allowed is not None and asset.dept_id not in allowed:
             raise NotFoundError("资产不存在或无权访问")
+
+    async def _get_accessible(self, asset_id: int, context: AuthContext) -> Asset:
+        asset = await self.assets.get_detail(asset_id)
+        if asset is None:
+            raise NotFoundError("资产不存在")
+        await self._assert_asset_accessible(asset, context)
+        return asset
+
+    async def _get_accessible_for_update(
+        self, asset_id: int, context: AuthContext
+    ) -> Asset:
+        asset = (
+            await self.session.execute(
+                select(Asset)
+                .where(Asset.id == asset_id, Asset.deleted_at.is_(None))
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if asset is None:
+            raise NotFoundError("资产不存在")
+        await self._assert_asset_accessible(asset, context)
         return asset
 
     async def detail(self, asset_id: int, context: AuthContext) -> AssetOut:
@@ -488,6 +511,51 @@ class AssetService:
             after=_asset_snapshot(asset),
         )
         await commit_or_conflict(self.session)
+        return self._asset_out(asset, context)
+
+    async def stock_in(
+        self,
+        asset_id: int,
+        payload: AssetStockInPayload,
+        context: AuthContext,
+    ) -> AssetOut:
+        asset = await self._get_accessible_for_update(asset_id, context)
+        if asset.version != payload.version:
+            raise ConflictError("资产信息已被他人修改，请刷新后重试")
+        if asset.status != AssetStatus.PENDING_STOCK:
+            raise BizError("仅待入库资产可以确认入库")
+        if asset.custodian_id is not None:
+            raise BizError("该资产已指定责任人，请先清除责任人后再确认入库")
+
+        before = asset_snapshot(asset)
+        asset.status = AssetStatus.IN_STOCK
+        await self.session.flush()
+        after = asset_snapshot(asset)
+        self.session.add(
+            AssetHistory(
+                asset_id=asset.id,
+                action="INBOUND",
+                action_label="验收入库",
+                from_status=AssetStatus.PENDING_STOCK,
+                to_status=AssetStatus.IN_STOCK,
+                before_snapshot=before,
+                after_snapshot=after,
+                operator_id=context.user.id,
+                operator_name=context.user.real_name or context.user.username,
+                summary="资产台账确认入库",
+            )
+        )
+        await self.audit.record(
+            action="asset.ledger.stock_in",
+            module="资产台账",
+            summary=f"确认入库：{asset.name}（{asset.asset_no}）",
+            actor=context.user,
+            resource_type="asset",
+            resource_id=asset.id,
+            before=before,
+            after=after,
+        )
+        await commit_or_conflict(self.session, code=40911)
         return self._asset_out(asset, context)
 
     def _editable(self, field_name: str, value: Any, context: AuthContext) -> Any:

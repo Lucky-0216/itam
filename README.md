@@ -168,6 +168,7 @@ cp .env.example .env
 | `DB_PASSWORD` | 业务数据库用户密码 |
 | `DB_ROOT_PASSWORD` | MySQL root 密码 |
 | `DEFAULT_ADMIN_PASSWORD` | 初始管理员密码，必须自行设置 |
+| `DEFAULT_USER_PASSWORD` | 可选；批量导入用户且未逐行填写初始密码时使用 |
 
 生成随机密钥与数据库密码：
 
@@ -304,6 +305,7 @@ docker compose down -v
 | `DEFAULT_ADMIN_USERNAME` | `admin` | 初始管理员用户名 |
 | `DEFAULT_ADMIN_PASSWORD` | 无（必填） | 初始管理员密码 |
 | `DEFAULT_ADMIN_NAME` | `系统管理员` | 初始管理员姓名 |
+| `DEFAULT_USER_PASSWORD` | 空 | 批量导入用户的默认初始密码；为空时必须逐行填写 |
 | `HTTP_PORT` | `80` | 前端对外端口 |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | `30` | Access Token 有效期（分钟） |
 | `REFRESH_TOKEN_EXPIRE_DAYS` | `7` | Refresh Token 有效期（天） |

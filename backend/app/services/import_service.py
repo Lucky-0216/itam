@@ -13,6 +13,7 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.exceptions import BizError
 from app.models import AssetCategory, AssetModel, Dept, Role, User
 from app.repositories.user_repo import UserRepository
@@ -24,7 +25,6 @@ from app.services.permission_service import AuthContext
 from app.services.user_admin_service import UserAdminService
 
 MAX_IMPORT_ROWS = 1000
-DEFAULT_USER_PASSWORD = "Itam@123456"
 
 CATEGORY_HEADERS = [
     "分类编码",
@@ -362,7 +362,11 @@ class ImportService:
                     if role_id is None:
                         raise ValueError(f"角色编码「{code}」不存在")
                     role_ids.append(role_id)
-                password = _text(row["初始密码"]) or DEFAULT_USER_PASSWORD
+                password = _text(row["初始密码"]) or settings.DEFAULT_USER_PASSWORD
+                if not password:
+                    raise ValueError(
+                        "未填写初始密码，且系统未配置 DEFAULT_USER_PASSWORD"
+                    )
                 await service.create_user(
                     UserCreate(
                         username=_text(row["用户名"]) or "",
@@ -464,7 +468,7 @@ class ImportService:
                 "张三",
                 "IT",
                 "EMPLOYEE",
-                DEFAULT_USER_PASSWORD,
+                settings.DEFAULT_USER_PASSWORD,
                 "E1001",
                 "zhangsan@example.com",
                 "13800000000",
@@ -476,7 +480,7 @@ class ImportService:
                 *_IMAGE_NOTES,
                 "用户名需为 3-50 位小写字母、数字、点、下划线或短横线，且不能重复。",
                 "部门编码、角色编码必须已存在于系统中；角色编码可用逗号分隔多个。",
-                f"初始密码留空时使用默认密码 {DEFAULT_USER_PASSWORD}，首次登录会强制修改。",
+                "初始密码留空时使用 DEFAULT_USER_PASSWORD；系统未配置该变量时必须填写。首次登录会强制修改。",
                 "状态可选：启用 / 停用。",
             ],
         )

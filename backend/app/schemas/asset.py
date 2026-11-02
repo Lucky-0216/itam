@@ -303,6 +303,10 @@ class AssetUpdate(BaseModel):
         return cleaned
 
 
+class AssetStockInPayload(BaseModel):
+    version: int = Field(ge=1)
+
+
 class AssetOut(BaseModel):
     id: int
     asset_no: str

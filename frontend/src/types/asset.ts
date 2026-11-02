@@ -197,6 +197,10 @@ export interface AssetUpdatePayload extends Omit<AssetPayload, 'asset_no'> {
   version: number
 }
 
+export interface AssetStockInPayload {
+  version: number
+}
+
 export interface AssetBatchUpdatePayload {
   asset_ids: number[]
   dept_id?: number | null

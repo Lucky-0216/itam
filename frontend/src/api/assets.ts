@@ -8,6 +8,7 @@ import type {
   AssetPage,
   AssetPayload,
   AssetQuery,
+  AssetStockInPayload,
   AssetTimelineItem,
   AssetUpdatePayload,
   CategoryField,
@@ -124,6 +125,17 @@ export const assetApi = {
       params,
       responseType: 'blob',
       timeout: 120000,
+    })
+  },
+
+  stockInAsset(
+    id: number,
+    payload: AssetStockInPayload,
+  ): Promise<AssetPage['items'][number]> {
+    return request<AssetPage['items'][number]>({
+      url: `/assets/${id}/stock-in`,
+      method: 'post',
+      data: payload,
     })
   },
 

@@ -5,6 +5,7 @@ import dayjs from 'dayjs'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
 import {
   Box,
+  CircleCheck,
   Delete,
   Document,
   Download,
@@ -150,6 +151,7 @@ watch(
 const canCreate = computed(() => auth.hasPerm('asset:ledger:create'))
 const canUpdate = computed(() => auth.hasPerm('asset:ledger:update'))
 const canDelete = computed(() => auth.hasPerm('asset:ledger:delete'))
+const canStockIn = computed(() => auth.hasPerm('asset:inbound:confirm'))
 const canExport = computed(() => auth.hasPerm('asset:report:export'))
 
 const categoryMap = computed(() => {
@@ -633,7 +635,7 @@ async function submitForm(): Promise<void> {
         asset_no: text(form.asset_no),
       })
       createDraft.clear()
-      ElMessage.success('资产已创建，初始状态为待入库')
+      ElMessage.success('资产已创建，确认入库后可在领用流程中选择')
     } else if (editingId.value) {
       await assetApi.updateAsset(editingId.value, {
         ...payload,
@@ -801,6 +803,25 @@ function formatFileSize(size: number): string {
   return `${size} B`
 }
 
+async function handleStockIn(row: AssetItem): Promise<void> {
+  if (row.custodian_id) {
+    ElMessage.warning('该资产已指定责任人，请先在编辑中清除责任人后再确认入库')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      `确认将资产「${row.name}（${row.asset_no}）」入库？入库后可在领用流程中选择该资产。`,
+      '确认入库',
+      { type: 'warning', confirmButtonText: '确认入库', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  await assetApi.stockInAsset(row.id, { version: row.version })
+  ElMessage.success('资产已入库')
+  await fetchAssets()
+}
+
 async function handleDelete(row: AssetItem): Promise<void> {
   try {
     await ElMessageBox.confirm(
@@ -822,6 +843,7 @@ async function handleDelete(row: AssetItem): Promise<void> {
 const ACTION_LABELS: Record<string, string> = {
   'asset.ledger.create': '创建资产',
   'asset.ledger.update': '编辑资产',
+  'asset.ledger.stock_in': '确认入库',
   'asset.ledger.delete': '删除资产',
   'asset.request.create': '发起业务申请',
   'asset.request.approve': '审批通过',
@@ -852,6 +874,7 @@ function timelineType(action: string): 'success' | 'primary' | 'danger' | 'info'
   if (
     action.endsWith('.return.confirm') ||
     action.endsWith('.outbound') ||
+    action.endsWith('.stock_in') ||
     action.endsWith('.complete')
   ) {
     return 'success'
@@ -907,7 +930,7 @@ function handleImported(): void {
         <p class="page-eyebrow">ASSET LEDGER</p>
         <h1 class="page-title">资产台账</h1>
         <p class="page-subtitle">
-          统一维护资产编号、分类型号、购置与保管信息；状态由业务流程驱动，台账内只读。
+          统一维护资产编号、分类型号、购置与保管信息；状态由业务流程驱动，待入库资产可在行内确认入库。
         </p>
       </div>
       <div class="page-actions">
@@ -1160,10 +1183,19 @@ function handleImported(): void {
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="196" fixed="right">
+        <el-table-column label="操作" width="252" fixed="right">
           <template #default="{ row }">
             <div class="row-actions">
               <el-button link type="primary" :icon="View" @click="openDetail(row)">详情</el-button>
+              <el-button
+                v-if="canStockIn && row.status === 'PENDING_STOCK'"
+                link
+                type="success"
+                :icon="CircleCheck"
+                @click="handleStockIn(row)"
+              >
+                入库
+              </el-button>
               <el-button
                 v-if="canUpdate"
                 link
@@ -1236,7 +1268,7 @@ function handleImported(): void {
             >
               {{ ASSET_STATUS_LABELS[editingStatus] }}
             </el-tag>
-            <span v-else class="form-section-note">创建后状态为「待入库」，由后续业务流程驱动</span>
+            <span v-else class="form-section-note">创建后状态为「待入库」，点击行内「入库」后可在领用流程中选择</span>
           </div>
           <div class="form-grid">
             <el-form-item label="资产名称" prop="name">

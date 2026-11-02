@@ -163,6 +163,88 @@ async def test_asset_create_list_update_delete(client: AsyncClient):
     assert listed_after.json()["data"]["total"] == 0
 
 
+async def test_ledger_asset_stock_in(client: AsyncClient):
+    tokens = await login(client)
+    headers = auth_headers(tokens["access_token"])
+    laptop = await _category(client, headers, "HW-LAPTOP")
+    it_dept = await _dept(client, headers, "IT")
+
+    created = await client.post(
+        "/api/v1/assets",
+        json={
+            "name": "台账入库测试笔记本",
+            "category_id": laptop["id"],
+            "dept_id": it_dept["id"],
+            "location": "A 座 401",
+            "custom_fields": {"cpu": "i7-1365U", "memory": "16GB", "os": "Windows 11"},
+        },
+        headers=headers,
+    )
+    assert created.status_code == 200, created.text
+    asset = created.json()["data"]
+    assert asset["status"] == "PENDING_STOCK"
+
+    unavailable_before = await client.get(
+        "/api/v1/asset-requests/available-assets",
+        params={"category_id": laptop["id"]},
+        headers=headers,
+    )
+    assert unavailable_before.status_code == 200, unavailable_before.text
+    assert unavailable_before.json()["data"]["total"] == 0
+
+    stale = await client.post(
+        f"/api/v1/assets/{asset['id']}/stock-in",
+        json={"version": asset["version"] + 1},
+        headers=headers,
+    )
+    assert stale.status_code == 409, stale.text
+
+    stocked = await client.post(
+        f"/api/v1/assets/{asset['id']}/stock-in",
+        json={"version": asset["version"]},
+        headers=headers,
+    )
+    assert stocked.status_code == 200, stocked.text
+    stocked_asset = stocked.json()["data"]
+    assert stocked_asset["status"] == "IN_STOCK"
+    assert stocked_asset["status_label"] == "在库"
+    assert stocked_asset["version"] == asset["version"] + 1
+
+    duplicate = await client.post(
+        f"/api/v1/assets/{asset['id']}/stock-in",
+        json={"version": stocked_asset["version"]},
+        headers=headers,
+    )
+    assert duplicate.status_code == 400, duplicate.text
+
+    history = await client.get(
+        f"/api/v1/assets/{asset['id']}/history", headers=headers
+    )
+    assert history.status_code == 200, history.text
+    history_items = history.json()["data"]
+    assert len(history_items) == 1
+    assert history_items[0]["action"] == "INBOUND"
+    assert history_items[0]["action_label"] == "验收入库"
+    assert history_items[0]["from_status"] == "PENDING_STOCK"
+    assert history_items[0]["to_status"] == "IN_STOCK"
+    assert history_items[0]["summary"] == "资产台账确认入库"
+
+    timeline = await client.get(
+        f"/api/v1/assets/{asset['id']}/timeline", headers=headers
+    )
+    actions = [item["action"] for item in timeline.json()["data"]]
+    assert "asset.ledger.stock_in" in actions
+
+    available_after = await client.get(
+        "/api/v1/asset-requests/available-assets",
+        params={"category_id": laptop["id"]},
+        headers=headers,
+    )
+    assert available_after.status_code == 200, available_after.text
+    available_items = available_after.json()["data"]["items"]
+    assert [item["id"] for item in available_items] == [asset["id"]]
+
+
 async def test_asset_validation_rules(client: AsyncClient):
     tokens = await login(client)
     headers = auth_headers(tokens["access_token"])

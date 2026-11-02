@@ -98,6 +98,47 @@ async def _category_id(code: str = "HW-LAPTOP") -> int:
         )
 
 
+async def _dept_id(code: str = "IT") -> int:
+    async with AsyncSessionLocal() as session:
+        return int(
+            (
+                await session.execute(select(Dept.id).where(Dept.code == code))
+            ).scalar_one()
+        )
+
+
+async def _create_and_stock_in(
+    client: AsyncClient,
+    headers: dict[str, str],
+    asset_no: str,
+    name: str,
+) -> int:
+    created = await client.post(
+        "/api/v1/assets",
+        json={
+            "asset_no": asset_no,
+            "name": name,
+            "category_id": await _category_id(),
+            "dept_id": await _dept_id(),
+            "location": "A 座 101",
+            "custom_fields": {},
+        },
+        headers=headers,
+    )
+    assert created.status_code == 200, created.text
+    asset = created.json()["data"]
+    assert asset["status"] == AssetStatus.PENDING_STOCK
+
+    stocked = await client.post(
+        f"/api/v1/assets/{asset['id']}/stock-in",
+        json={"version": asset["version"]},
+        headers=headers,
+    )
+    assert stocked.status_code == 200, stocked.text
+    assert stocked.json()["data"]["status"] == AssetStatus.IN_STOCK
+    return asset["id"]
+
+
 async def _login_as(client: AsyncClient, username: str) -> dict[str, str]:
     response = await client.post(
         "/api/v1/auth/login",
@@ -109,7 +150,9 @@ async def _login_as(client: AsyncClient, username: str) -> dict[str, str]:
 
 async def test_requisition_and_return_flow(client: AsyncClient):
     admin_headers = auth_headers((await login(client))["access_token"])
-    asset_id = await _ensure_asset("ITAM-FLOW-0001", "流程测试笔记本")
+    asset_id = await _create_and_stock_in(
+        client, admin_headers, "ITAM-FLOW-0001", "流程测试笔记本"
+    )
     employee_id = await _ensure_user("flow_emp", "流程员工", "EMPLOYEE")
     await _ensure_user("flow_dept", "部门管理员", "DEPT_ADMIN")
     await _ensure_user("flow_asset", "资产管理员", "ASSET_ADMIN")
@@ -267,12 +310,15 @@ async def test_requisition_and_return_flow(client: AsyncClient):
     )
     assert history.status_code == 200, history.text
     history_items = history.json()["data"]
-    assert len(history_items) == 1
+    assert len(history_items) == 2
     assert history_items[0]["action"] == "OUTBOUND"
     assert history_items[0]["from_status"] == "IN_STOCK"
     assert history_items[0]["to_status"] == "IN_USE"
     assert history_items[0]["before_snapshot"]["custodian_name"] is None
     assert history_items[0]["after_snapshot"]["custodian_name"] == "流程员工"
+    assert history_items[1]["action"] == "INBOUND"
+    assert history_items[1]["from_status"] == "PENDING_STOCK"
+    assert history_items[1]["to_status"] == "IN_STOCK"
 
     duplicate_outbound = await client.post(
         f"/api/v1/asset-requests/{request_id}/outbound",
@@ -333,7 +379,7 @@ async def test_requisition_and_return_flow(client: AsyncClient):
         f"/api/v1/assets/{asset_id}/history", headers=admin_headers
     )
     history_items = history.json()["data"]
-    assert len(history_items) == 2
+    assert len(history_items) == 3
     latest = history_items[0]
     assert latest["action"] == "RETURN"
     assert latest["from_status"] == "IN_USE"

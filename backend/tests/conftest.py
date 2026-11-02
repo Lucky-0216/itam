@@ -6,6 +6,7 @@ os.environ["TOKEN_STORE"] = "memory"
 os.environ["SECRET_KEY"] = "test-secret-key-for-itam-only-0123456789abc"
 os.environ["DEFAULT_ADMIN_USERNAME"] = "admin"
 os.environ["DEFAULT_ADMIN_PASSWORD"] = "Test@12345"
+os.environ["DEFAULT_USER_PASSWORD"] = "Test@12345"
 os.environ["UPLOAD_DIR"] = "./test_uploads"
 os.environ["SEED_SAMPLE_DATA"] = "true"
 
