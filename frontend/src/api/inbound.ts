@@ -7,8 +7,10 @@ import type {
   InboundDeptOption,
   InboundModelOption,
   InboundPage,
+  InboundReversePayload,
   InboundStatus,
   InboundType,
+  InboundUpdatePayload,
   StockAssetPage,
   StockCategoryOption,
   StockOverview,
@@ -53,6 +55,18 @@ export const inboundApi = {
 
   create(payload: InboundCreatePayload): Promise<Inbound> {
     return request<Inbound>({ url: '/inbounds', method: 'post', data: payload })
+  },
+
+  update(id: number, payload: InboundUpdatePayload): Promise<Inbound> {
+    return request<Inbound>({ url: `/inbounds/${id}`, method: 'put', data: payload })
+  },
+
+  reverseAssets(id: number, payload: InboundReversePayload): Promise<Inbound> {
+    return request<Inbound>({
+      url: `/inbounds/${id}/reverse-assets`,
+      method: 'post',
+      data: payload,
+    })
   },
 
   previewCodes(baseNo: string, quantity: number): Promise<InboundCodePreview> {

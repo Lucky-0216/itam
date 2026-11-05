@@ -9,6 +9,7 @@ export type AssetStatus =
   | 'REPAIRING'
   | 'PENDING_SCRAP'
   | 'SCRAPPED'
+  | 'VOIDED'
 
 export interface CategoryField {
   id: number
@@ -151,6 +152,9 @@ export interface AssetItem {
   custom_fields: Record<string, unknown>
   remark: string | null
   masked_fields: string[]
+  voided_at: string | null
+  voided_by_name: string | null
+  void_reason: string | null
   version: number
   created_at: string
   updated_at: string
@@ -215,6 +219,20 @@ export interface AssetBatchUpdateResult {
   updated: number
 }
 
+export interface AssetVoidPayload {
+  reason: string
+  version: number
+}
+
+export interface AssetBatchVoidPayload {
+  asset_ids: number[]
+  reason: string
+}
+
+export interface AssetBatchVoidResult {
+  voided: number
+}
+
 export interface CustodianOption {
   id: number
   username: string
@@ -274,6 +292,7 @@ export const ASSET_STATUS_LABELS: Record<AssetStatus, string> = {
   REPAIRING: '维修中',
   PENDING_SCRAP: '待报废',
   SCRAPPED: '已报废',
+  VOIDED: '已作废',
 }
 
 export const ASSET_STATUS_TAG_TYPES: Record<
@@ -288,4 +307,5 @@ export const ASSET_STATUS_TAG_TYPES: Record<
   REPAIRING: 'warning',
   PENDING_SCRAP: 'danger',
   SCRAPPED: 'info',
+  VOIDED: 'info',
 }

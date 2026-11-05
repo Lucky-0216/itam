@@ -747,7 +747,7 @@ onMounted(() => {
             <template #default="{ data }">
               <div class="category-node">
                 <span class="category-node-main">
-                  <span class="category-name">{{ data.name }}</span>
+                  <span class="category-name" :title="data.name">{{ data.name }}</span>
                   <span class="category-meta">
                     <el-tag
                       size="small"
@@ -757,12 +757,12 @@ onMounted(() => {
                       {{ categoryTypeLabel(data.category_type) }}
                     </el-tag>
                     <span class="category-code">{{ data.code }}</span>
+                    <span class="category-stats">
+                      {{ data.model_count }} 型号 · {{ data.asset_count }} 资产
+                    </span>
                   </span>
                 </span>
                 <span class="category-node-side" @click.stop>
-                  <span class="category-counts">
-                    {{ data.model_count }} 型号 · {{ data.asset_count }} 资产
-                  </span>
                   <el-dropdown
                     trigger="click"
                     @command="handleCategoryCommand($event, data)"
@@ -1485,14 +1485,23 @@ onMounted(() => {
 .category-meta {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
+  row-gap: 2px;
   margin-top: 3px;
+  min-width: 0;
 }
 
 .category-code {
   font-size: 10.5px;
   color: var(--text-3);
   font-family: var(--font-number);
+}
+
+.category-stats {
+  font-size: 10.5px;
+  color: var(--text-3);
+  white-space: nowrap;
 }
 
 .category-node-side {
@@ -1507,12 +1516,6 @@ onMounted(() => {
 .category-node:hover .category-node-side,
 .el-tree-node.is-current .category-node-side {
   opacity: 1;
-}
-
-.category-counts {
-  font-size: 10.5px;
-  color: var(--text-3);
-  white-space: nowrap;
 }
 
 .category-more {
@@ -1697,7 +1700,9 @@ onMounted(() => {
 }
 
 :deep(.el-tree-node__content) {
-  height: 46px;
+  height: auto;
+  min-height: 46px;
+  padding: 4px 0;
   border-radius: 10px;
   margin-bottom: 2px;
 }

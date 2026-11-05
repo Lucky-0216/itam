@@ -303,7 +303,9 @@ class AssetHistory(Base, IdMixin):
 class Asset(Base, IdMixin, TimestampMixin, VersionMixin):
     __tablename__ = "ast_assets"
     __table_args__ = (
-        UniqueConstraint("asset_no", name="uq_ast_assets_asset_no"),
+        UniqueConstraint(
+            "asset_no", "void_seq", name="uq_ast_assets_asset_no_void_seq"
+        ),
         Index("ix_ast_assets_category_id", "category_id"),
         Index("ix_ast_assets_model_id", "model_id"),
         Index("ix_ast_assets_dept_id", "dept_id"),
@@ -347,11 +349,21 @@ class Asset(Base, IdMixin, TimestampMixin, VersionMixin):
     custom_fields: Mapped[dict | None] = mapped_column(JSON)
     remark: Mapped[str | None] = mapped_column(String(255))
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime)
+    void_seq: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    voided_at: Mapped[datetime | None] = mapped_column(DateTime)
+    voided_by_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("sys_users.id", ondelete="SET NULL"),
+    )
+    voided_by_name: Mapped[str | None] = mapped_column(String(50))
+    void_reason: Mapped[str | None] = mapped_column(String(500))
 
     category: Mapped[AssetCategory] = relationship("AssetCategory", lazy="selectin")
     model: Mapped[AssetModel | None] = relationship("AssetModel", lazy="selectin")
     dept: Mapped[Dept | None] = relationship("Dept", lazy="selectin")
-    custodian: Mapped[User | None] = relationship("User", lazy="selectin")
+    custodian: Mapped[User | None] = relationship(
+        "User", foreign_keys=[custodian_id], lazy="selectin"
+    )
 
 
 class AssetAttachment(Base, IdMixin, TimestampMixin):

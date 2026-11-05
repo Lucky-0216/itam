@@ -14,7 +14,7 @@ from app.core.asset_ops import (
     INBOUND_TYPE_LABELS,
     InboundStatus,
 )
-from app.core.assets import AssetStatus
+from app.core.assets import ASSET_STATUS_LABELS, AssetStatus
 from app.core.config import settings
 from app.core.exceptions import BizError, ConflictError, NotFoundError, PermissionDenied
 from app.models import (
@@ -34,12 +34,19 @@ from app.repositories.asset_repo import AssetRepository
 from app.schemas.inbound import (
     AssetInboundOut,
     AssetInboundPageOut,
+    InboundAssetOut,
     InboundCancelPayload,
     InboundConfirmPayload,
     InboundCreate,
     InboundItemOut,
+    InboundReversePayload,
+    InboundUpdate,
 )
 from app.services.asset_snapshot import asset_snapshot
+from app.services.asset_void import (
+    apply_void,
+    ensure_no_active_business,
+)
 from app.services.audit_service import AuditService
 from app.services.permission_service import AuthContext
 from app.services.scope_service import scoped_dept_ids
@@ -201,29 +208,45 @@ class InboundService:
             )
         return result
 
-    async def _assert_codes_available(self, line_index: int, codes: list[str]) -> None:
+    async def _assert_codes_available(
+        self,
+        line_index: int,
+        codes: list[str],
+        *,
+        exclude_inbound_id: int | None = None,
+    ) -> None:
         if not codes:
             return
         keys = [code.casefold() for code in codes]
         asset_nos = set(
             (
                 await self.session.execute(
-                    select(Asset.asset_no).where(func.lower(Asset.asset_no).in_(keys))
-                )
-            )
-            .scalars()
-            .all()
-        )
-        reserved = set(
-            (
-                await self.session.execute(
-                    select(AssetInboundCode.asset_no).where(
-                        func.lower(AssetInboundCode.asset_no).in_(keys)
+                    select(Asset.asset_no).where(
+                        func.lower(Asset.asset_no).in_(keys),
+                        Asset.deleted_at.is_(None),
                     )
                 )
             )
             .scalars()
             .all()
+        )
+        reserved_stmt = (
+            select(AssetInboundCode.asset_no)
+            .join(
+                AssetInbound,
+                AssetInbound.id == AssetInboundCode.inbound_id,
+            )
+            .where(
+                func.lower(AssetInboundCode.asset_no).in_(keys),
+                AssetInbound.status == InboundStatus.PENDING,
+            )
+        )
+        if exclude_inbound_id is not None:
+            reserved_stmt = reserved_stmt.where(
+                AssetInboundCode.inbound_id != exclude_inbound_id
+            )
+        reserved = set(
+            (await self.session.execute(reserved_stmt)).scalars().all()
         )
         existing = {value.casefold() for value in asset_nos | reserved}
         for code in codes:
@@ -243,7 +266,10 @@ class InboundService:
         asset_nos = set(
             (
                 await self.session.execute(
-                    select(Asset.asset_no).where(func.lower(Asset.asset_no).in_(keys))
+                    select(Asset.asset_no).where(
+                        func.lower(Asset.asset_no).in_(keys),
+                        Asset.deleted_at.is_(None),
+                    )
                 )
             )
             .scalars()
@@ -253,7 +279,14 @@ class InboundService:
             (
                 await self.session.execute(
                     select(AssetInboundCode.asset_no)
-                    .where(func.lower(AssetInboundCode.asset_no).in_(keys))
+                    .join(
+                        AssetInbound,
+                        AssetInbound.id == AssetInboundCode.inbound_id,
+                    )
+                    .where(
+                        func.lower(AssetInboundCode.asset_no).in_(keys),
+                        AssetInbound.status == InboundStatus.PENDING,
+                    )
                     .with_for_update()
                 )
             )
@@ -428,12 +461,62 @@ class InboundService:
             remark=item.remark,
         )
 
+    async def _assets_for_inbound(
+        self, item: AssetInbound
+    ) -> list[InboundAssetOut]:
+        if item.status != InboundStatus.COMPLETED:
+            return []
+        code_maps = await self._code_lists([item.id])
+        codes = [
+            code
+            for line_codes in code_maps.get(item.id, {}).values()
+            for code in line_codes
+        ]
+        if not codes:
+            return []
+        rows = (
+            (
+                await self.session.execute(
+                    select(Asset).where(
+                        func.lower(Asset.asset_no).in_(
+                            [code.casefold() for code in codes]
+                        )
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        by_no = {asset.asset_no.casefold(): asset for asset in rows}
+        result: list[InboundAssetOut] = []
+        for code in codes:
+            asset = by_no.get(code.casefold())
+            if asset is None:
+                continue
+            result.append(
+                InboundAssetOut(
+                    id=asset.id,
+                    asset_no=asset.asset_no,
+                    name=asset.name,
+                    status=asset.status,
+                    status_label=ASSET_STATUS_LABELS.get(
+                        asset.status, asset.status
+                    ),
+                    can_reverse=(
+                        asset.status == AssetStatus.IN_STOCK
+                        and asset.deleted_at is None
+                    ),
+                )
+            )
+        return result
+
     def _inbound_out(
         self,
         item: AssetInbound,
         context: AuthContext,
         allowed: set[int] | None,
         code_map: dict[int, list[str]] | None = None,
+        assets: list[InboundAssetOut] | None = None,
     ) -> AssetInboundOut:
         in_scope = self._in_scope(item.dept_id, allowed)
         can_confirm = (
@@ -445,6 +528,23 @@ class InboundService:
             item.created_by_id == context.user.id
             or context.has_permission("asset:inbound:cancel")
         )
+        can_edit = (
+            item.status == InboundStatus.PENDING
+            and context.has_permission("asset:inbound:create")
+            and in_scope
+        )
+        asset_rows = assets or []
+        can_reverse = (
+            item.status == InboundStatus.COMPLETED
+            and context.has_permission("asset:inbound:confirm")
+            and in_scope
+            and any(asset.can_reverse for asset in asset_rows)
+        )
+        can_supplement = (
+            item.status == InboundStatus.COMPLETED
+            and context.has_permission("asset:inbound:create")
+            and in_scope
+        )
         return AssetInboundOut(
             id=item.id,
             inbound_no=item.inbound_no,
@@ -453,6 +553,7 @@ class InboundService:
             status=item.status,
             status_label=INBOUND_STATUS_LABELS.get(item.status, item.status),
             status_tag_type=INBOUND_STATUS_TAG_TYPES.get(item.status, "info"),
+            source_inbound_id=item.source_inbound_id,
             supplier=item.supplier,
             purchase_date=item.purchase_date,
             location=item.location,
@@ -469,6 +570,9 @@ class InboundService:
             cancel_reason=item.cancel_reason,
             can_confirm=can_confirm,
             can_cancel=can_cancel,
+            can_edit=can_edit,
+            can_reverse=can_reverse,
+            can_supplement=can_supplement,
             version=item.version,
             created_at=item.created_at,
             updated_at=item.updated_at,
@@ -476,6 +580,7 @@ class InboundService:
                 self._item_out(line, (code_map or {}).get(line.id))
                 for line in item.items
             ],
+            assets=asset_rows,
         )
 
     async def list_inbounds(
@@ -540,8 +645,9 @@ class InboundService:
         if not self._in_scope(item.dept_id, allowed):
             raise PermissionDenied("无权查看该入库单")
         code_maps = await self._code_lists([item.id])
+        assets = await self._assets_for_inbound(item)
         return self._inbound_out(
-            item, context, allowed, code_maps.get(item.id, {})
+            item, context, allowed, code_maps.get(item.id, {}), assets
         )
 
     async def _resolve_dept(self, dept_id: int | None) -> Dept | None:
@@ -573,10 +679,19 @@ class InboundService:
                 raise BizError(f"第 {index} 行资产型号与分类不一致")
         return category, model
 
-    async def create_inbound(
-        self, payload: InboundCreate, context: AuthContext
-    ) -> AssetInboundOut:
-        allowed = await self._allowed_depts(context)
+    async def _prepare_lines(
+        self,
+        payload: InboundCreate,
+        allowed: set[int] | None,
+        *,
+        exclude_inbound_id: int | None = None,
+    ) -> tuple[
+        Dept | None,
+        list[AssetInboundItem],
+        list[list[str] | None],
+        int,
+        Decimal,
+    ]:
         dept = await self._resolve_dept(payload.dept_id)
         if allowed is not None and (dept is None or dept.id not in allowed):
             raise PermissionDenied("无权在该部门下创建入库单")
@@ -588,7 +703,11 @@ class InboundService:
         for index, current in enumerate(payload.items, start=1):
             category, model = await self._resolve_line(current, index)
             if current.asset_nos is not None:
-                await self._assert_codes_available(index, current.asset_nos)
+                await self._assert_codes_available(
+                    index,
+                    current.asset_nos,
+                    exclude_inbound_id=exclude_inbound_id,
+                )
             unit_price = (
                 Decimal(str(current.unit_price))
                 if current.unit_price is not None
@@ -612,6 +731,24 @@ class InboundService:
                 )
             )
             explicit_codes.append(current.asset_nos)
+        return dept, lines, explicit_codes, total_quantity, total_amount
+
+    async def create_inbound(
+        self, payload: InboundCreate, context: AuthContext
+    ) -> AssetInboundOut:
+        allowed = await self._allowed_depts(context)
+        dept, lines, explicit_codes, total_quantity, total_amount = (
+            await self._prepare_lines(payload, allowed)
+        )
+        source = None
+        if payload.source_inbound_id is not None:
+            source = await self._get_inbound(payload.source_inbound_id)
+            if source.status != InboundStatus.COMPLETED:
+                raise BizError("仅已完成的入库单可以创建补录单")
+            if not self._in_scope(source.dept_id, allowed):
+                raise PermissionDenied("无权补录该入库单")
+            if source.dept_id != (dept.id if dept else None):
+                raise BizError("补录单的所属部门需与原入库单一致")
 
         item = AssetInbound(
             inbound_no=await self._next_no(),
@@ -625,6 +762,7 @@ class InboundService:
             total_quantity=total_quantity,
             total_amount=total_amount,
             remark=payload.remark,
+            source_inbound_id=source.id if source else None,
             created_by_id=context.user.id,
             created_by_name=_user_name(context.user),
             items=lines,
@@ -651,6 +789,203 @@ class InboundService:
         code_maps = await self._code_lists([item.id])
         return self._inbound_out(
             item, context, allowed, code_maps.get(item.id, {})
+        )
+
+    async def update_inbound(
+        self,
+        inbound_id: int,
+        payload: InboundUpdate,
+        context: AuthContext,
+    ) -> AssetInboundOut:
+        item = await self._get_inbound(inbound_id, for_update=True)
+        allowed = await self._allowed_depts(context)
+        if not self._in_scope(item.dept_id, allowed):
+            raise PermissionDenied("无权操作该入库单")
+        if item.status != InboundStatus.PENDING:
+            raise BizError("仅待确认的入库单可以修改")
+        if payload.version != item.version:
+            raise ConflictError(INBOUND_CONFLICT_MESSAGE, code=40911)
+
+        before = {
+            "status": item.status,
+            "supplier": item.supplier,
+            "purchase_date": (
+                item.purchase_date.isoformat() if item.purchase_date else None
+            ),
+            "location": item.location,
+            "dept_id": item.dept_id,
+            "total_quantity": item.total_quantity,
+            "total_amount": float(item.total_amount or 0),
+            "items": [
+                {"name": line.name, "quantity": line.quantity}
+                for line in item.items
+            ],
+        }
+
+        await self.session.execute(
+            delete(AssetInboundCode).where(AssetInboundCode.inbound_id == item.id)
+        )
+        item.items = []
+        await self.session.flush()
+
+        dept, lines, explicit_codes, total_quantity, total_amount = (
+            await self._prepare_lines(
+                payload, allowed, exclude_inbound_id=item.id
+            )
+        )
+        item.inbound_type = payload.inbound_type
+        item.supplier = payload.supplier
+        item.purchase_date = payload.purchase_date or now_cst().date()
+        item.location = payload.location
+        item.dept_id = dept.id if dept else None
+        item.dept_name = dept.name if dept else None
+        item.dept = dept
+        item.total_quantity = total_quantity
+        item.total_amount = total_amount
+        item.remark = payload.remark
+        item.items = lines
+        await self.session.flush()
+        await self._allocate_codes(item, lines, explicit_codes)
+        await self.audit.record(
+            action="asset.inbound.update",
+            module="asset",
+            summary=f"修改入库单：{item.inbound_no}（{total_quantity} 件）",
+            actor=context.user,
+            resource_type="asset_inbound",
+            resource_id=item.id,
+            before=before,
+            after={
+                "status": item.status,
+                "total_quantity": total_quantity,
+                "total_amount": float(total_amount),
+            },
+        )
+        await commit_or_conflict(self.session, code=40911)
+        code_maps = await self._code_lists([item.id])
+        return self._inbound_out(
+            item, context, allowed, code_maps.get(item.id, {})
+        )
+
+    async def reverse_assets(
+        self,
+        inbound_id: int,
+        payload: InboundReversePayload,
+        context: AuthContext,
+    ) -> AssetInboundOut:
+        item = await self._get_inbound(inbound_id, for_update=True)
+        allowed = await self._allowed_depts(context)
+        if not self._in_scope(item.dept_id, allowed):
+            raise PermissionDenied("无权操作该入库单")
+        if item.status != InboundStatus.COMPLETED:
+            raise BizError("仅已确认的入库单可以冲销")
+        if payload.version != item.version:
+            raise ConflictError(INBOUND_CONFLICT_MESSAGE, code=40911)
+
+        keys = [code.casefold() for code in payload.asset_nos]
+        owned = set(
+            (
+                await self.session.execute(
+                    select(AssetInboundCode.asset_no).where(
+                        AssetInboundCode.inbound_id == item.id,
+                        func.lower(AssetInboundCode.asset_no).in_(keys),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        owned_keys = {code.casefold() for code in owned}
+        missing = [
+            code for code in payload.asset_nos if code.casefold() not in owned_keys
+        ]
+        if missing:
+            raise BizError(
+                f"资产编码「{missing[0]}」不属于入库单 {item.inbound_no}，无法冲销"
+            )
+
+        rows = list(
+            (
+                await self.session.execute(
+                    select(Asset)
+                    .where(
+                        func.lower(Asset.asset_no).in_(keys),
+                        Asset.deleted_at.is_(None),
+                    )
+                    .with_for_update()
+                )
+            )
+            .scalars()
+            .all()
+        )
+        by_no = {asset.asset_no.casefold(): asset for asset in rows}
+        missing_assets = [
+            code for code in payload.asset_nos if code.casefold() not in by_no
+        ]
+        if missing_assets:
+            raise BizError(
+                f"资产「{missing_assets[0]}」不存在或已作废，请刷新后重试"
+            )
+        for code in payload.asset_nos:
+            asset = by_no[code.casefold()]
+            if asset.status != AssetStatus.IN_STOCK:
+                status_label = ASSET_STATUS_LABELS.get(
+                    asset.status, asset.status
+                )
+                raise BizError(
+                    f"资产「{asset.asset_no}」当前为「{status_label}」，"
+                    "无法直接冲销，请先归还或处理至在库状态"
+                )
+            await ensure_no_active_business(self.session, asset.id)
+
+        reversed_nos: list[str] = []
+        for code in payload.asset_nos:
+            asset = by_no[code.casefold()]
+            before, after = await apply_void(
+                self.session,
+                asset,
+                reason=payload.reason,
+                operator=context.user,
+                action="INBOUND_REVERSAL",
+                action_label="入库冲销",
+                summary=(
+                    f"入库单 {item.inbound_no} 冲销："
+                    f"{asset.name}（{asset.asset_no}），原因：{payload.reason}"
+                ),
+            )
+            reversed_nos.append(asset.asset_no)
+            await self.audit.record(
+                action="asset.inbound.reverse",
+                module="asset",
+                summary=(
+                    f"入库冲销：{item.inbound_no} / "
+                    f"{asset.name}（{asset.asset_no}）"
+                ),
+                actor=context.user,
+                resource_type="asset",
+                resource_id=asset.id,
+                before=before,
+                after=after,
+            )
+        await self.audit.record(
+            action="asset.inbound.reverse",
+            module="asset",
+            summary=(
+                f"冲销入库单：{item.inbound_no}，"
+                f"作废 {len(reversed_nos)} 台/件资产"
+            ),
+            actor=context.user,
+            resource_type="asset_inbound",
+            resource_id=item.id,
+            after={
+                "reason": payload.reason,
+                "asset_nos": reversed_nos,
+            },
+        )
+        await commit_or_conflict(self.session, code=40911)
+        code_maps = await self._code_lists([item.id])
+        assets = await self._assets_for_inbound(item)
+        return self._inbound_out(
+            item, context, allowed, code_maps.get(item.id, {}), assets
         )
 
     async def confirm_inbound(
@@ -719,7 +1054,8 @@ class InboundService:
                         select(Asset.asset_no).where(
                             func.lower(Asset.asset_no).in_(
                                 [code.casefold() for code in all_codes]
-                            )
+                            ),
+                            Asset.deleted_at.is_(None),
                         )
                     )
                 )
@@ -806,8 +1142,9 @@ class InboundService:
             },
         )
         await commit_or_conflict(self.session, code=40911)
+        assets = await self._assets_for_inbound(item)
         return self._inbound_out(
-            item, context, allowed, code_maps.get(item.id, {})
+            item, context, allowed, code_maps.get(item.id, {}), assets
         )
 
     async def cancel_inbound(

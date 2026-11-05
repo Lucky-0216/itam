@@ -90,8 +90,16 @@ class AssetFlowService:
                 sequence = int(suffix) + 1
         return f"{head}{sequence:04d}"
 
-    async def _get_asset(self, asset_id: int, *, for_update: bool = False) -> Asset:
-        stmt = select(Asset).where(Asset.id == asset_id, Asset.deleted_at.is_(None))
+    async def _get_asset(
+        self,
+        asset_id: int,
+        *,
+        for_update: bool = False,
+        include_deleted: bool = False,
+    ) -> Asset:
+        stmt = select(Asset).where(Asset.id == asset_id)
+        if not include_deleted:
+            stmt = stmt.where(Asset.deleted_at.is_(None))
         if for_update:
             stmt = stmt.with_for_update()
         asset = (await self.session.execute(stmt)).scalar_one_or_none()
@@ -1861,7 +1869,7 @@ class AssetFlowService:
         asset_id: int,
         context: AuthContext,
     ) -> list[AssetHistoryOut]:
-        asset = await self._get_asset(asset_id)
+        asset = await self._get_asset(asset_id, include_deleted=True)
         allowed = await self._allowed_depts(context)
         if not context.is_superuser:
             if context.data_scope == DataScope.SELF:

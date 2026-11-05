@@ -9,9 +9,11 @@ from app.core.database import get_db
 from app.core.response import ok
 from app.schemas.asset import (
     AssetBatchUpdate,
+    AssetBatchVoidPayload,
     AssetCreate,
     AssetStockInPayload,
     AssetUpdate,
+    AssetVoidPayload,
 )
 from app.services.asset_service import AssetService
 from app.services.permission_service import AuthContext
@@ -145,6 +147,27 @@ async def update_asset(
     return ok(result.model_dump(mode="json"), message="资产已更新")
 
 
+@router.post("/assets/batch-void", summary="批量作废资产")
+async def batch_void_assets(
+    payload: AssetBatchVoidPayload,
+    context: AuthContext = Depends(require_perm("asset:ledger:delete")),
+    session: AsyncSession = Depends(get_db),
+):
+    count = await AssetService(session).batch_void(payload, context)
+    return ok({"voided": count}, message=f"已作废 {count} 项资产")
+
+
+@router.post("/assets/{asset_id}/void", summary="作废资产并释放编码")
+async def void_asset(
+    asset_id: int,
+    payload: AssetVoidPayload,
+    context: AuthContext = Depends(require_perm("asset:ledger:delete")),
+    session: AsyncSession = Depends(get_db),
+):
+    result = await AssetService(session).void(asset_id, payload, context)
+    return ok(result.model_dump(mode="json"), message="资产已作废，编码已释放")
+
+
 @router.post("/assets/{asset_id}/stock-in", summary="资产确认入库")
 async def stock_in_asset(
     asset_id: int,
@@ -163,7 +186,7 @@ async def delete_asset(
     session: AsyncSession = Depends(get_db),
 ):
     await AssetService(session).delete(asset_id, context)
-    return ok(None, message="资产已删除")
+    return ok(None, message="资产已作废，编码已释放")
 
 
 @router.get("/assets/{asset_id}/attachments", summary="资产附件列表")

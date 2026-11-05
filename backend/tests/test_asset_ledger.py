@@ -154,13 +154,37 @@ async def test_asset_create_list_update_delete(client: AsyncClient):
     removed = await client.delete(f"/api/v1/assets/{asset['id']}", headers=headers)
     assert removed.status_code == 200, removed.text
 
-    gone = await client.get(f"/api/v1/assets/{asset['id']}", headers=headers)
-    assert gone.status_code == 404
+    voided = await client.get(f"/api/v1/assets/{asset['id']}", headers=headers)
+    assert voided.status_code == 200, voided.text
+    assert voided.json()["data"]["status"] == "VOIDED"
+    assert voided.json()["data"]["void_reason"] == "台账删除"
 
     listed_after = await client.get(
         "/api/v1/assets", params={"keyword": "SN-TEST-001"}, headers=headers
     )
     assert listed_after.json()["data"]["total"] == 0
+
+    voided_list = await client.get(
+        "/api/v1/assets",
+        params={"keyword": "SN-TEST-001", "status": "VOIDED"},
+        headers=headers,
+    )
+    assert voided_list.status_code == 200, voided_list.text
+    assert voided_list.json()["data"]["total"] == 1
+
+    recreated = await client.post(
+        "/api/v1/assets",
+        json={
+            "asset_no": asset["asset_no"],
+            "name": "编码复用测试",
+            "category_id": laptop["id"],
+            "custom_fields": {},
+        },
+        headers=headers,
+    )
+    assert recreated.status_code == 200, recreated.text
+    assert recreated.json()["data"]["asset_no"] == asset["asset_no"]
+    assert recreated.json()["data"]["status"] == "PENDING_STOCK"
 
 
 async def test_ledger_asset_stock_in(client: AsyncClient):

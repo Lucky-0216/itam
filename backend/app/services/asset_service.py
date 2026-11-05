@@ -43,16 +43,23 @@ from app.repositories.asset_repo import (
 from app.schemas.asset import (
     AssetAttachmentOut,
     AssetBatchUpdate,
+    AssetBatchVoidPayload,
     AssetCreate,
     AssetOut,
     AssetPageOut,
     AssetStockInPayload,
     AssetTimelineItem,
     AssetUpdate,
+    AssetVoidPayload,
     CustodianOptionOut,
     DeptOptionOut,
 )
 from app.services.asset_snapshot import asset_snapshot
+from app.services.asset_void import (
+    apply_void,
+    assert_voidable,
+    ensure_no_active_business,
+)
 from app.services.audit_service import AuditService
 from app.services.permission_service import AuthContext
 from app.services.scope_service import asset_scope_conditions, is_self_only, scoped_dept_ids
@@ -128,8 +135,12 @@ class AssetService:
         self.models = AssetModelRepository(session)
         self.audit = AuditService(session)
 
-    async def _scope_conditions(self, context: AuthContext) -> list[Any]:
-        return await asset_scope_conditions(self.session, context)
+    async def _scope_conditions(
+        self, context: AuthContext, *, include_deleted: bool = False
+    ) -> list[Any]:
+        return await asset_scope_conditions(
+            self.session, context, include_deleted=include_deleted
+        )
 
     async def _assert_dept_in_scope(self, dept_id: int | None, context: AuthContext) -> None:
         if is_self_only(context):
@@ -312,6 +323,9 @@ class AssetService:
             custom_fields=asset.custom_fields or {},
             remark=visible("remark", asset.remark),
             masked_fields=masked,
+            voided_at=asset.voided_at,
+            voided_by_name=asset.voided_by_name,
+            void_reason=asset.void_reason,
             version=asset.version,
             created_at=asset.created_at,
             updated_at=asset.updated_at,
@@ -363,7 +377,9 @@ class AssetService:
         custodian_id: int | None,
         warranty_days: int | None,
     ) -> list[Any]:
-        conditions = await self._scope_conditions(context)
+        conditions = await self._scope_conditions(
+            context, include_deleted=status == AssetStatus.VOIDED
+        )
         category_ids = await self._category_ids(category_id, include_child)
         if category_ids is not None:
             if not category_ids:
@@ -412,8 +428,10 @@ class AssetService:
         elif allowed is not None and asset.dept_id not in allowed:
             raise NotFoundError("资产不存在或无权访问")
 
-    async def _get_accessible(self, asset_id: int, context: AuthContext) -> Asset:
-        asset = await self.assets.get_detail(asset_id)
+    async def _get_accessible(
+        self, asset_id: int, context: AuthContext, *, include_voided: bool = False
+    ) -> Asset:
+        asset = await self.assets.get_detail(asset_id, include_deleted=include_voided)
         if asset is None:
             raise NotFoundError("资产不存在")
         await self._assert_asset_accessible(asset, context)
@@ -435,7 +453,7 @@ class AssetService:
         return asset
 
     async def detail(self, asset_id: int, context: AuthContext) -> AssetOut:
-        asset = await self._get_accessible(asset_id, context)
+        asset = await self._get_accessible(asset_id, context, include_voided=True)
         return self._asset_out(asset, context)
 
     async def create(self, payload: AssetCreate, context: AuthContext) -> AssetOut:
@@ -454,7 +472,7 @@ class AssetService:
 
         asset_no = payload.asset_no
         if asset_no:
-            exists = await self.assets.get_by_asset_no(asset_no, include_deleted=True)
+            exists = await self.assets.get_by_asset_no(asset_no)
             if exists is not None:
                 raise ConflictError("资产编号已存在", code=40930)
             reserved = await self.session.scalar(
@@ -642,21 +660,78 @@ class AssetService:
             return new_value
         return new_value if context.can_edit_field("asset", field_name) else old_value
 
-    async def delete(self, asset_id: int, context: AuthContext) -> None:
-        asset = await self._get_accessible(asset_id, context)
-        if asset.status not in (AssetStatus.PENDING_STOCK, AssetStatus.IN_STOCK):
-            raise BizError("仅待入库或在库资产可直接删除，其他状态请先走业务流程")
-        before = _asset_snapshot(asset)
-        asset.deleted_at = now_cst()
+    async def _void_locked(
+        self,
+        asset: Asset,
+        reason: str,
+        context: AuthContext,
+        *,
+        action: str = "VOID",
+        action_label: str = "资产作废",
+        summary_prefix: str = "作废资产",
+    ) -> None:
+        assert_voidable(asset)
+        await ensure_no_active_business(self.session, asset.id)
+        before, after = await apply_void(
+            self.session,
+            asset,
+            reason=reason,
+            operator=context.user,
+            action=action,
+            action_label=action_label,
+            summary=f"{summary_prefix}：{asset.name}（{asset.asset_no}），原因：{reason}",
+        )
         await self.audit.record(
-            action="asset.ledger.delete",
+            action="asset.ledger.void",
             module="资产台账",
-            summary=f"删除资产：{asset.name}（{asset.asset_no}）",
+            summary=f"{summary_prefix}：{asset.name}（{asset.asset_no}）",
             actor=context.user,
             resource_type="asset",
             resource_id=asset.id,
             before=before,
+            after=after,
         )
+
+    async def void(
+        self, asset_id: int, payload: AssetVoidPayload, context: AuthContext
+    ) -> AssetOut:
+        asset = await self._get_accessible_for_update(asset_id, context)
+        if asset.version != payload.version:
+            raise ConflictError("资产信息已被他人修改，请刷新后重试")
+        await self._void_locked(asset, payload.reason, context)
+        await commit_or_conflict(self.session, code=40911)
+        return self._asset_out(asset, context)
+
+    async def batch_void(
+        self, payload: AssetBatchVoidPayload, context: AuthContext
+    ) -> int:
+        conditions = await self._scope_conditions(context)
+        conditions.extend(
+            [Asset.id.in_(payload.asset_ids), Asset.deleted_at.is_(None)]
+        )
+        rows = list(
+            (
+                await self.session.execute(
+                    select(Asset).where(*conditions).with_for_update()
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if len(rows) != len(payload.asset_ids):
+            raise NotFoundError("部分资产不存在、已作废或不在数据范围内")
+        for asset in rows:
+            assert_voidable(asset)
+        for asset in rows:
+            await ensure_no_active_business(self.session, asset.id)
+        for asset in rows:
+            await self._void_locked(asset, payload.reason, context)
+        await commit_or_conflict(self.session, code=40911)
+        return len(rows)
+
+    async def delete(self, asset_id: int, context: AuthContext) -> None:
+        asset = await self._get_accessible_for_update(asset_id, context)
+        await self._void_locked(asset, "台账删除", context)
         await commit_or_conflict(self.session)
 
     async def batch_update(self, payload: AssetBatchUpdate, context: AuthContext) -> int:
@@ -828,7 +903,7 @@ class AssetService:
         )
 
     async def timeline(self, asset_id: int, context: AuthContext) -> list[AssetTimelineItem]:
-        await self._get_accessible(asset_id, context)
+        await self._get_accessible(asset_id, context, include_voided=True)
         stmt = (
             select(AuditLog)
             .where(

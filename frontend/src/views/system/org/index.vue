@@ -986,7 +986,9 @@ onMounted(() => {
           <el-table-column label="部门 / 岗位" min-width="150">
             <template #default="{ row }">
               <div class="stack-cell">
-                <span>{{ row.dept_name || '未分配部门' }}</span>
+                <span :title="row.dept_path || row.dept_name || '未分配部门'">
+                  {{ row.dept_path || row.dept_name || '未分配部门' }}
+                </span>
                 <small>{{ row.position || '未设置岗位' }}</small>
               </div>
             </template>

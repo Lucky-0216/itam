@@ -28,6 +28,7 @@ class AssetInbound(Base, IdMixin, TimestampMixin, VersionMixin):
         Index("ix_ast_asset_inbounds_inbound_type", "inbound_type"),
         Index("ix_ast_asset_inbounds_dept_id", "dept_id"),
         Index("ix_ast_asset_inbounds_created_by_id", "created_by_id"),
+        Index("ix_ast_asset_inbounds_source_inbound_id", "source_inbound_id"),
     )
 
     inbound_no: Mapped[str] = mapped_column(String(50), nullable=False)
@@ -45,6 +46,10 @@ class AssetInbound(Base, IdMixin, TimestampMixin, VersionMixin):
         Numeric(14, 2), nullable=False, default=Decimal("0")
     )
     remark: Mapped[str | None] = mapped_column(String(500))
+    source_inbound_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("ast_asset_inbounds.id", ondelete="SET NULL"),
+    )
 
     created_by_id: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("sys_users.id", ondelete="SET NULL")
@@ -122,9 +127,7 @@ class AssetCodeSequence(Base):
 class AssetInboundCode(Base, IdMixin):
     __tablename__ = "ast_asset_inbound_codes"
     __table_args__ = (
-        UniqueConstraint(
-            "asset_no", name="uq_ast_asset_inbound_codes_asset_no"
-        ),
+        Index("ix_ast_asset_inbound_codes_asset_no", "asset_no"),
         Index("ix_ast_asset_inbound_codes_inbound_id", "inbound_id"),
         Index("ix_ast_asset_inbound_codes_item_id", "item_id"),
     )

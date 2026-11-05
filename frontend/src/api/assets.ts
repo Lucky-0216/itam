@@ -3,6 +3,8 @@ import type {
   AssetAttachment,
   AssetBatchUpdatePayload,
   AssetBatchUpdateResult,
+  AssetBatchVoidPayload,
+  AssetBatchVoidResult,
   AssetCategory,
   AssetDeptOption,
   AssetPage,
@@ -11,6 +13,7 @@ import type {
   AssetStockInPayload,
   AssetTimelineItem,
   AssetUpdatePayload,
+  AssetVoidPayload,
   CategoryField,
   CategoryFieldPayload,
   CategoryFieldUpdatePayload,
@@ -141,6 +144,22 @@ export const assetApi = {
 
   deleteAsset(id: number): Promise<null> {
     return request<null>({ url: `/assets/${id}`, method: 'delete' })
+  },
+
+  voidAsset(id: number, payload: AssetVoidPayload): Promise<AssetPage['items'][number]> {
+    return request<AssetPage['items'][number]>({
+      url: `/assets/${id}/void`,
+      method: 'post',
+      data: payload,
+    })
+  },
+
+  batchVoidAssets(payload: AssetBatchVoidPayload): Promise<AssetBatchVoidResult> {
+    return request<AssetBatchVoidResult>({
+      url: '/assets/batch-void',
+      method: 'post',
+      data: payload,
+    })
   },
 
   custodianOptions(keyword?: string): Promise<CustodianOption[]> {

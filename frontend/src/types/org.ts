@@ -52,6 +52,7 @@ export interface OrgUser {
   avatar: string | null
   dept_id: number | null
   dept_name: string | null
+  dept_path: string | null
   position: string | null
   status: number
   source: string

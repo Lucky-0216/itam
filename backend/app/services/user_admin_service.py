@@ -1,3 +1,4 @@
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import BizError, ConflictError, NotFoundError, PermissionDenied
@@ -32,7 +33,30 @@ def _role_briefs(roles: list[Role]) -> list[UserRoleOut]:
     ]
 
 
-def _serialize(user: User) -> UserOut:
+async def _dept_path_lookup(session: AsyncSession) -> dict[int, str]:
+    depts = list((await session.execute(select(Dept))).scalars().all())
+    by_id = {dept.id: dept for dept in depts}
+    cache: dict[int, str] = {}
+
+    def build(dept: Dept) -> str:
+        cached = cache.get(dept.id)
+        if cached is not None:
+            return cached
+        names: list[str] = []
+        current: Dept | None = dept
+        seen: set[int] = set()
+        while current is not None and current.id not in seen:
+            seen.add(current.id)
+            names.append(current.name)
+            current = by_id.get(current.parent_id) if current.parent_id else None
+        path = "\\".join(reversed(names))
+        cache[dept.id] = path
+        return path
+
+    return {dept.id: build(dept) for dept in depts}
+
+
+def _serialize(user: User, dept_paths: dict[int, str] | None = None) -> UserOut:
     return UserOut(
         id=user.id,
         username=user.username,
@@ -43,6 +67,7 @@ def _serialize(user: User) -> UserOut:
         avatar=user.avatar,
         dept_id=user.dept_id,
         dept_name=user.dept.name if user.dept else None,
+        dept_path=dept_paths.get(user.dept_id) if dept_paths and user.dept_id else None,
         position=user.position,
         status=user.status,
         source=user.source,
@@ -54,8 +79,10 @@ def _serialize(user: User) -> UserOut:
     )
 
 
-def _serialize_detail(user: User) -> UserDetailOut:
-    base = _serialize(user)
+def _serialize_detail(
+    user: User, dept_paths: dict[int, str] | None = None
+) -> UserDetailOut:
+    base = _serialize(user, dept_paths)
     return UserDetailOut(**base.model_dump(), remark=user.remark, token_version=user.token_version)
 
 
@@ -111,8 +138,9 @@ class UserAdminService:
             role_id=role_id,
             self_user_id=context.user.id if is_self_only(context) else None,
         )
+        dept_paths = await _dept_path_lookup(self.session)
         return UserPageOut(
-            items=[_serialize(user) for user in users],
+            items=[_serialize(user, dept_paths) for user in users],
             total=total,
             page=page,
             page_size=page_size,
@@ -132,7 +160,7 @@ class UserAdminService:
         if user is None:
             raise NotFoundError("用户不存在")
         await self._assert_visible(user, context)
-        return _serialize_detail(user)
+        return _serialize_detail(user, await _dept_path_lookup(self.session))
 
     async def create_user(self, payload: UserCreate, context: AuthContext) -> UserDetailOut:
         dept = await self._assert_dept_active(payload.dept_id)
@@ -175,7 +203,7 @@ class UserAdminService:
         )
         await commit_or_conflict(self.session)
         reloaded = await self.users.get_detail(user.id)
-        return _serialize_detail(reloaded or user)
+        return _serialize_detail(reloaded or user, await _dept_path_lookup(self.session))
 
     async def update_user(
         self,
@@ -239,7 +267,7 @@ class UserAdminService:
         )
         await commit_or_conflict(self.session)
         reloaded = await self.users.get_detail(user.id)
-        return _serialize_detail(reloaded or user)
+        return _serialize_detail(reloaded or user, await _dept_path_lookup(self.session))
 
     async def set_status(
         self,
@@ -276,7 +304,7 @@ class UserAdminService:
             after=_snapshot(user),
         )
         await commit_or_conflict(self.session)
-        return _serialize_detail(user)
+        return _serialize_detail(user, await _dept_path_lookup(self.session))
 
     async def reset_password(
         self,

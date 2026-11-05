@@ -377,6 +377,52 @@ async function submitBatch(): Promise<void> {
   }
 }
 
+const batchVoidVisible = ref(false)
+const batchVoidSubmitting = ref(false)
+const batchVoidReason = ref('')
+
+function selectableRow(row: AssetItem): boolean {
+  return row.status !== 'VOIDED'
+}
+
+function openBatchVoid(): void {
+  if (!selectedRows.value.length) {
+    ElMessage.warning('请先勾选要作废的资产')
+    return
+  }
+  if (selectedRows.value.some((item) => !selectableRow(item))) {
+    ElMessage.warning('已作废资产不能重复作废，请取消勾选')
+    return
+  }
+  batchVoidReason.value = ''
+  batchVoidVisible.value = true
+}
+
+async function submitBatchVoid(): Promise<void> {
+  const reason = batchVoidReason.value.trim()
+  if (!reason) {
+    ElMessage.warning('请填写作废原因')
+    return
+  }
+  if (reason.length > 500) {
+    ElMessage.warning('作废原因不能超过 500 个字符')
+    return
+  }
+  batchVoidSubmitting.value = true
+  try {
+    const result = await assetApi.batchVoidAssets({
+      asset_ids: selectedRows.value.map((item) => item.id),
+      reason,
+    })
+    ElMessage.success(`已作废 ${result.voided} 项资产，编码已释放`)
+    batchVoidVisible.value = false
+    await fetchAssets()
+    clearSelection()
+  } finally {
+    batchVoidSubmitting.value = false
+  }
+}
+
 const exporting = ref(false)
 
 async function exportLedger(): Promise<void> {
@@ -822,18 +868,32 @@ async function handleStockIn(row: AssetItem): Promise<void> {
   await fetchAssets()
 }
 
-async function handleDelete(row: AssetItem): Promise<void> {
+async function handleVoid(row: AssetItem): Promise<void> {
+  let reason = ''
   try {
-    await ElMessageBox.confirm(
-      `确定删除资产「${row.name}（${row.asset_no}）」吗？仅待入库或在库资产可直接删除。`,
-      '删除资产',
-      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
+    const result = await ElMessageBox.prompt(
+      `作废资产「${row.name}（${row.asset_no}）」后，编码将被释放并可重新使用，资产记录、状态变更与审计日志全部保留。仅待入库或在库资产可直接作废。`,
+      '作废资产',
+      {
+        type: 'warning',
+        confirmButtonText: '确认作废',
+        cancelButtonText: '取消',
+        inputType: 'textarea',
+        inputPlaceholder: '请填写作废原因（必填）',
+        inputValidator: (value: string) => {
+          const text = (value || '').trim()
+          if (!text) return '请填写作废原因'
+          if (text.length > 500) return '作废原因不能超过 500 个字符'
+          return true
+        },
+      },
     )
+    reason = result.value.trim()
   } catch {
     return
   }
-  await assetApi.deleteAsset(row.id)
-  ElMessage.success('资产已删除')
+  await assetApi.voidAsset(row.id, { reason, version: row.version })
+  ElMessage.success('资产已作废，编码已释放')
   if (assets.value.length === 1 && query.page > 1) {
     query.page -= 1
   }
@@ -845,6 +905,9 @@ const ACTION_LABELS: Record<string, string> = {
   'asset.ledger.update': '编辑资产',
   'asset.ledger.stock_in': '确认入库',
   'asset.ledger.delete': '删除资产',
+  'asset.ledger.void': '作废资产',
+  'asset.inbound.update': '更新入库单',
+  'asset.inbound.reverse': '入库冲销',
   'asset.request.create': '发起业务申请',
   'asset.request.approve': '审批通过',
   'asset.request.reject': '驳回申请',
@@ -870,7 +933,13 @@ function actionLabel(action: string): string {
 }
 
 function timelineType(action: string): 'success' | 'primary' | 'danger' | 'info' {
-  if (action.endsWith('.delete') || action.endsWith('.reject')) return 'danger'
+  if (
+    action.endsWith('.delete') ||
+    action.endsWith('.void') ||
+    action.endsWith('.reject')
+  ) {
+    return 'danger'
+  }
   if (
     action.endsWith('.return.confirm') ||
     action.endsWith('.outbound') ||
@@ -1067,6 +1136,15 @@ function handleImported(): void {
       <div v-if="canUpdate && selectedRows.length" class="batch-bar">
         <span class="batch-count">已选择 {{ selectedRows.length }} 项资产</span>
         <el-button type="primary" plain :icon="Edit" @click="openBatch">批量编辑</el-button>
+        <el-button
+          v-if="canDelete"
+          type="danger"
+          plain
+          :icon="Delete"
+          @click="openBatchVoid"
+        >
+          批量作废
+        </el-button>
         <el-button text @click="clearSelection">清空选择</el-button>
       </div>
 
@@ -1081,7 +1159,13 @@ function handleImported(): void {
         @selection-change="handleSelectionChange"
         @header-dragend="columnWidths.onHeaderDragend"
       >
-        <el-table-column v-if="canUpdate" type="selection" width="46" fixed="left" />
+        <el-table-column
+          v-if="canUpdate"
+          type="selection"
+          width="46"
+          fixed="left"
+          :selectable="selectableRow"
+        />
         <el-table-column
           label="资产"
           column-key="asset"
@@ -1114,15 +1198,15 @@ function handleImported(): void {
         </el-table-column>
 
         <el-table-column
-          label="部门 / 责任人"
+          label="责任人 / 部门"
           column-key="dept"
           :width="columnWidths.widthOf('dept')"
           min-width="170"
         >
           <template #default="{ row }">
             <div class="stack-cell">
-              <span>{{ row.dept_name || '未分配部门' }}</span>
-              <small>{{ row.custodian_name || '未指定责任人' }}</small>
+              <span>{{ row.custodian_name || '未指定责任人' }}</span>
+              <small>{{ row.dept_name || '未分配部门' }}</small>
             </div>
           </template>
         </el-table-column>
@@ -1197,7 +1281,7 @@ function handleImported(): void {
                 入库
               </el-button>
               <el-button
-                v-if="canUpdate"
+                v-if="canUpdate && row.status !== 'VOIDED'"
                 link
                 type="primary"
                 :icon="Edit"
@@ -1206,13 +1290,13 @@ function handleImported(): void {
                 编辑
               </el-button>
               <el-button
-                v-if="canDelete"
+                v-if="canDelete && row.status !== 'VOIDED'"
                 link
                 type="danger"
                 :icon="Delete"
-                @click="handleDelete(row)"
+                @click="handleVoid(row)"
               >
-                删除
+                作废
               </el-button>
             </div>
           </template>
@@ -1590,6 +1674,39 @@ function handleImported(): void {
       </template>
     </el-dialog>
 
+    <el-dialog
+      v-model="batchVoidVisible"
+      title="批量作废资产"
+      width="520px"
+      :close-on-click-modal="false"
+    >
+      <el-alert
+        type="warning"
+        :closable="false"
+        show-icon
+        :title="`将作废 ${selectedRows.length} 项资产，编码会释放并可重新使用，记录与审计日志保留。仅待入库或在库资产可作废，存在处理中业务的资产会被拦截。`"
+      />
+      <el-input
+        v-model="batchVoidReason"
+        type="textarea"
+        :rows="3"
+        maxlength="500"
+        show-word-limit
+        placeholder="请填写作废原因（必填）"
+        class="batch-void-reason"
+      />
+      <template #footer>
+        <el-button @click="batchVoidVisible = false">取消</el-button>
+        <el-button
+          type="danger"
+          :loading="batchVoidSubmitting"
+          @click="submitBatchVoid"
+        >
+          确认作废
+        </el-button>
+      </template>
+    </el-dialog>
+
     <el-drawer
       v-model="detailVisible"
       size="540px"
@@ -1690,6 +1807,22 @@ function handleImported(): void {
                 <template v-else>{{ detailAsset.remark || '—' }}</template>
               </el-descriptions-item>
             </el-descriptions>
+          </div>
+
+          <div v-if="detailAsset.status === 'VOIDED'" class="detail-section">
+            <p class="detail-section-title">作废信息</p>
+            <el-descriptions :column="2" border size="small">
+              <el-descriptions-item label="作废时间">
+                {{ detailAsset.voided_at ? formatDateTime(detailAsset.voided_at) : '—' }}
+              </el-descriptions-item>
+              <el-descriptions-item label="作废人">
+                {{ detailAsset.voided_by_name || '系统' }}
+              </el-descriptions-item>
+              <el-descriptions-item label="作废原因" :span="2">
+                {{ detailAsset.void_reason || '—' }}
+              </el-descriptions-item>
+            </el-descriptions>
+            <p class="batch-note">该资产编码已释放，可重新登记使用；历史记录与审计日志保留。</p>
           </div>
 
           <div v-if="detailCategoryFields.length" class="detail-section">
@@ -1964,6 +2097,10 @@ function handleImported(): void {
   margin: 0;
   font-size: 11.5px;
   color: var(--text-3);
+}
+
+.batch-void-reason {
+  margin-top: 14px;
 }
 
 .asset-cell {

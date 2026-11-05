@@ -13,9 +13,11 @@ def is_self_only(context: AuthContext) -> bool:
 async def asset_scope_conditions(
     session: AsyncSession,
     context: AuthContext,
+    *,
+    include_deleted: bool = False,
 ) -> list:
     """资产类查询的通用数据范围条件。"""
-    conditions: list = [Asset.deleted_at.is_(None)]
+    conditions: list = [] if include_deleted else [Asset.deleted_at.is_(None)]
     if is_self_only(context):
         conditions.append(Asset.custodian_id == context.user.id)
         return conditions

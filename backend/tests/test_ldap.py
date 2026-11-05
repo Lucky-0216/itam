@@ -230,6 +230,83 @@ async def test_ldap_sync_creates_dept_tree_and_users(client: AsyncClient):
     assert wangwu.status == 1
 
 
+def _deep_dept_entries() -> list[dict]:
+    return [
+        {
+            "dn": "OU=NDCZ_Company,DC=example,DC=com",
+            "attributes": {"ou": "NDCZ_Company", "name": "NDCZ_Company"},
+        },
+        {
+            "dn": "OU=ZCB,OU=NDCZ_Company,DC=example,DC=com",
+            "attributes": {"ou": "ZCB", "name": "ZCB"},
+        },
+        {
+            "dn": "OU=XXB,OU=ZCB,OU=NDCZ_Company,DC=example,DC=com",
+            "attributes": {"ou": "XXB", "name": "XXB"},
+        },
+    ]
+
+
+def _deep_user_entries() -> list[dict]:
+    return [
+        {
+            "dn": "CN=甘忠天,OU=XXB,OU=ZCB,OU=NDCZ_Company,DC=example,DC=com",
+            "attributes": {
+                "sAMAccountName": "zhongtian.gan",
+                "displayName": "甘忠天",
+                "mail": "zhongtian.gan@example.com",
+                "userAccountControl": "512",
+            },
+        }
+    ]
+
+
+async def test_ldap_sync_builds_full_ou_path(client: AsyncClient):
+    tokens = await login(client)
+    headers = auth_headers(tokens["access_token"])
+    config = await _save_config(client, headers)
+
+    with patch(
+        "app.services.ldap_service._fetch_directory",
+        return_value=(_deep_dept_entries(), _deep_user_entries()),
+    ):
+        log = await _run_sync(config["id"])
+
+    assert log.status == "SUCCESS", log.error_message
+    assert log.dept_created == 3
+    assert log.user_created == 1
+
+    company = await _get_dept_by_dn("OU=NDCZ_Company,DC=example,DC=com")
+    center = await _get_dept_by_dn("OU=ZCB,OU=NDCZ_Company,DC=example,DC=com")
+    dept = await _get_dept_by_dn("OU=XXB,OU=ZCB,OU=NDCZ_Company,DC=example,DC=com")
+    assert company is not None and center is not None and dept is not None
+    assert company.parent_id is None
+    assert center.parent_id == company.id
+    assert dept.parent_id == center.id
+    assert company.path == f"/{company.id}/"
+    assert center.path == f"/{company.id}/{center.id}/"
+    assert dept.path == f"/{company.id}/{center.id}/{dept.id}/"
+    assert dept.level == company.level + 2
+
+    user = await _get_user("zhongtian.gan")
+    assert user is not None
+    assert user.dept_id == dept.id
+    assert user.real_name == "甘忠天"
+
+    response = await client.get(
+        "/api/v1/users",
+        params={"keyword": "zhongtian.gan"},
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["code"] == 0, body
+    items = body["data"]["items"]
+    matched = next(item for item in items if item["username"] == "zhongtian.gan")
+    assert matched["dept_name"] == "XXB"
+    assert matched["dept_path"] == "NDCZ_Company\\ZCB\\XXB"
+
+
 async def test_ldap_sync_disables_missing_user_and_moves_department(client: AsyncClient):
     tokens = await login(client)
     headers = auth_headers(tokens["access_token"])

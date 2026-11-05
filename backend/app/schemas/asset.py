@@ -307,6 +307,42 @@ class AssetStockInPayload(BaseModel):
     version: int = Field(ge=1)
 
 
+class AssetVoidPayload(BaseModel):
+    reason: str = Field(min_length=1, max_length=500)
+    version: int = Field(ge=1)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def trim_reason(cls, value: object) -> object:
+        return _blank_to_none(value)
+
+
+class AssetBatchVoidPayload(BaseModel):
+    asset_ids: list[int] = Field(min_length=1, max_length=200)
+    reason: str = Field(min_length=1, max_length=500)
+
+    @field_validator("asset_ids")
+    @classmethod
+    def normalize_asset_ids(cls, value: list[int]) -> list[int]:
+        unique: list[int] = []
+        seen: set[int] = set()
+        for raw in value:
+            item = int(raw)
+            if item <= 0:
+                raise ValueError("资产编号不正确")
+            if item not in seen:
+                seen.add(item)
+                unique.append(item)
+        if len(unique) > 200:
+            raise ValueError("单次批量作废最多 200 项资产")
+        return unique
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def trim_reason(cls, value: object) -> object:
+        return _blank_to_none(value)
+
+
 class AssetOut(BaseModel):
     id: int
     asset_no: str
@@ -333,6 +369,9 @@ class AssetOut(BaseModel):
     custom_fields: dict[str, Any] = Field(default_factory=dict)
     remark: str | None = None
     masked_fields: list[str] = Field(default_factory=list)
+    voided_at: datetime | None = None
+    voided_by_name: str | None = None
+    void_reason: str | None = None
     version: int
     created_at: datetime
     updated_at: datetime

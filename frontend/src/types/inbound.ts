@@ -64,7 +64,27 @@ export interface InboundCreatePayload {
   location?: string | null
   dept_id?: number | null
   remark?: string | null
+  source_inbound_id?: number | null
   items: InboundItemPayload[]
+}
+
+export interface InboundUpdatePayload extends InboundCreatePayload {
+  version: number
+}
+
+export interface InboundReversePayload {
+  asset_nos: string[]
+  reason: string
+  version: number
+}
+
+export interface InboundAsset {
+  id: number
+  asset_no: string
+  name: string
+  status: string
+  status_label: string
+  can_reverse: boolean
 }
 
 export interface Inbound {
@@ -91,10 +111,15 @@ export interface Inbound {
   cancel_reason: string | null
   can_confirm: boolean
   can_cancel: boolean
+  can_edit: boolean
+  can_reverse: boolean
+  can_supplement: boolean
+  source_inbound_id: number | null
   version: number
   created_at: string
   updated_at: string
   items: InboundItem[]
+  assets: InboundAsset[]
 }
 
 export interface InboundPage {

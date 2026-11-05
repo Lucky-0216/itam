@@ -72,6 +72,7 @@ class InboundCreate(BaseModel):
     location: str | None = Field(default=None, max_length=120)
     dept_id: int | None = Field(default=None, gt=0)
     remark: str | None = Field(default=None, max_length=500)
+    source_inbound_id: int | None = Field(default=None, gt=0)
     items: list[InboundItemCreate] = Field(min_length=1, max_length=50)
 
     @field_validator("supplier", "location", "remark", mode="before")
@@ -94,6 +95,42 @@ class InboundCreate(BaseModel):
                     )
                 seen[key] = index
         return self
+
+
+class InboundUpdate(InboundCreate):
+    version: int = Field(ge=1)
+
+
+class InboundReversePayload(BaseModel):
+    asset_nos: list[str] = Field(min_length=1, max_length=200)
+    reason: str = Field(min_length=1, max_length=500)
+    version: int = Field(ge=1)
+
+    @field_validator("asset_nos", mode="before")
+    @classmethod
+    def trim_asset_nos(cls, value: object) -> object:
+        if value is None or not isinstance(value, list):
+            return value
+        return [item.strip() if isinstance(item, str) else item for item in value]
+
+    @field_validator("asset_nos")
+    @classmethod
+    def check_asset_nos(cls, value: list[str]) -> list[str]:
+        unique: list[str] = []
+        seen: set[str] = set()
+        for code in value:
+            if not isinstance(code, str) or not _ASSET_NO_RE.fullmatch(code):
+                raise ValueError(f"资产编码「{code or '空'}」格式不正确")
+            key = code.casefold()
+            if key not in seen:
+                seen.add(key)
+                unique.append(code)
+        return unique
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def trim_reason(cls, value: object) -> object:
+        return _blank_to_none(value)
 
 
 class InboundConfirmPayload(BaseModel):
@@ -131,6 +168,15 @@ class InboundItemOut(BaseModel):
     remark: str | None = None
 
 
+class InboundAssetOut(BaseModel):
+    id: int
+    asset_no: str
+    name: str
+    status: str
+    status_label: str
+    can_reverse: bool = False
+
+
 class AssetInboundOut(BaseModel):
     id: int
     inbound_no: str
@@ -139,6 +185,7 @@ class AssetInboundOut(BaseModel):
     status: str
     status_label: str
     status_tag_type: str
+    source_inbound_id: int | None = None
     supplier: str | None = None
     purchase_date: date | None = None
     location: str | None = None
@@ -155,10 +202,14 @@ class AssetInboundOut(BaseModel):
     cancel_reason: str | None = None
     can_confirm: bool = False
     can_cancel: bool = False
+    can_edit: bool = False
+    can_reverse: bool = False
+    can_supplement: bool = False
     version: int
     created_at: datetime
     updated_at: datetime
     items: list[InboundItemOut] = Field(default_factory=list)
+    assets: list[InboundAssetOut] = Field(default_factory=list)
 
 
 class AssetInboundPageOut(BaseModel):

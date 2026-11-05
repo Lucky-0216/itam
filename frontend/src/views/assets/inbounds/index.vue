@@ -9,8 +9,11 @@ import { useFilterMemory } from '@/composables/useFilterMemory'
 import { useAuthStore } from '@/stores/auth'
 import type {
   Inbound,
+  InboundAsset,
   InboundCategoryOption,
   InboundDeptOption,
+  InboundItem,
+  InboundItemPayload,
   InboundModelOption,
   InboundStatus,
   InboundType,
@@ -76,9 +79,18 @@ const statusOptions = Object.entries(INBOUND_STATUS_LABELS) as Array<
 const typeOptions = Object.entries(INBOUND_TYPE_LABELS) as Array<[InboundType, string]>
 
 const canCreate = computed(() => auth.hasPerm('asset:inbound:create'))
+const canConfirm = computed(() => auth.hasPerm('asset:inbound:confirm'))
+
+type CreateMode = 'create' | 'edit' | 'supplement'
 
 const createVisible = ref(false)
 const createSubmitting = ref(false)
+const createMode = ref<CreateMode>('create')
+const editingId = ref<number | null>(null)
+const editingVersion = ref(0)
+const editingNo = ref('')
+const sourceInboundId = ref<number | null>(null)
+const sourceInboundNo = ref('')
 const categories = ref<InboundCategoryOption[]>([])
 const depts = ref<InboundDeptOption[]>([])
 const modelsByCategory = reactive<Record<number, InboundModelOption[]>>({})
@@ -99,6 +111,23 @@ const confirmVisible = ref(false)
 const confirmItem = ref<Inbound | null>(null)
 const confirmComment = ref('')
 const confirmSubmitting = ref(false)
+
+const reverseVisible = ref(false)
+const reverseItem = ref<Inbound | null>(null)
+const reverseSubmitting = ref(false)
+const reverseReason = ref('')
+const reverseSelected = ref<InboundAsset[]>([])
+
+const createTitle = computed(() => {
+  if (createMode.value === 'edit') return `编辑入库单 ${editingNo.value}`
+  if (createMode.value === 'supplement') return `补录入库单（原单 ${sourceInboundNo.value}）`
+  return '新建入库单'
+})
+const createSubmitText = computed(() => {
+  if (createMode.value === 'edit') return '保存修改'
+  if (createMode.value === 'supplement') return '创建补录单'
+  return '创建入库单'
+})
 
 let lineSequence = 0
 const previewTimers = new Map<number, ReturnType<typeof setTimeout>>()
@@ -196,8 +225,18 @@ async function ensureOptions(): Promise<void> {
   await Promise.all(tasks)
 }
 
+function resetCreationState(): void {
+  createMode.value = 'create'
+  editingId.value = null
+  editingVersion.value = 0
+  editingNo.value = ''
+  sourceInboundId.value = null
+  sourceInboundNo.value = ''
+}
+
 async function openCreate(): Promise<void> {
   clearPreviewTimers()
+  resetCreationState()
   form.inbound_type = 'PURCHASE'
   form.supplier = ''
   form.purchase_date = ''
@@ -207,6 +246,74 @@ async function openCreate(): Promise<void> {
   form.items = [emptyLine()]
   createVisible.value = true
   await ensureOptions()
+}
+
+function lineFromItem(item: InboundItem, quantity = item.quantity): LineForm {
+  const line = emptyLine()
+  line.category_id = item.category_id
+  line.model_id = item.model_id ?? undefined
+  line.name = item.name
+  line.quantity = quantity
+  line.base_asset_no = item.base_asset_no ?? ''
+  line.asset_nos = quantity === item.quantity ? [...item.asset_nos] : []
+  line.unit_price = item.unit_price ?? undefined
+  line.warranty_end = item.warranty_end ?? ''
+  line.remark = item.remark ?? ''
+  return line
+}
+
+async function ensureLineModels(lines: LineForm[]): Promise<void> {
+  const missing = [
+    ...new Set(
+      lines
+        .map((line) => line.category_id)
+        .filter((id): id is number => typeof id === 'number'),
+    ),
+  ].filter((id) => !modelsByCategory[id])
+  await Promise.all(
+    missing.map(async (id) => {
+      modelsByCategory[id] = await inboundApi.models(id)
+    }),
+  )
+}
+
+async function openEdit(row: Inbound): Promise<void> {
+  clearPreviewTimers()
+  const detail = await inboundApi.get(row.id)
+  resetCreationState()
+  createMode.value = 'edit'
+  editingId.value = detail.id
+  editingVersion.value = detail.version
+  editingNo.value = detail.inbound_no
+  form.inbound_type = detail.inbound_type
+  form.supplier = detail.supplier ?? ''
+  form.purchase_date = detail.purchase_date ?? ''
+  form.location = detail.location ?? ''
+  form.dept_id = detail.dept_id ?? undefined
+  form.remark = detail.remark ?? ''
+  form.items = detail.items.map((item) => lineFromItem(item))
+  createVisible.value = true
+  await ensureOptions()
+  await ensureLineModels(form.items)
+}
+
+async function openSupplement(row: Inbound): Promise<void> {
+  clearPreviewTimers()
+  const detail = await inboundApi.get(row.id)
+  resetCreationState()
+  createMode.value = 'supplement'
+  sourceInboundId.value = detail.id
+  sourceInboundNo.value = detail.inbound_no
+  form.inbound_type = detail.inbound_type
+  form.supplier = detail.supplier ?? ''
+  form.purchase_date = ''
+  form.location = detail.location ?? ''
+  form.dept_id = detail.dept_id ?? undefined
+  form.remark = `补录入库（原单 ${detail.inbound_no}）`
+  form.items = detail.items.map((item) => lineFromItem(item, 1))
+  createVisible.value = true
+  await ensureOptions()
+  await ensureLineModels(form.items)
 }
 
 function addLine(): void {
@@ -385,35 +492,53 @@ async function submitCreate(): Promise<void> {
   }
   createSubmitting.value = true
   try {
-    const created = await inboundApi.create({
+    const items: InboundItemPayload[] = form.items.map((line) => {
+      const base = line.base_asset_no.trim()
+      return {
+        category_id: line.category_id as number,
+        model_id: line.model_id ?? null,
+        name: line.name.trim(),
+        quantity: line.quantity,
+        base_asset_no: base || null,
+        asset_nos:
+          base && line.codes_edited
+            ? line.asset_nos.map((code) => code.trim())
+            : null,
+        unit_price: line.unit_price ?? null,
+        warranty_end: line.warranty_end || null,
+        remark: line.remark.trim() || null,
+      }
+    })
+    const payload = {
       inbound_type: form.inbound_type,
       supplier: form.supplier.trim() || null,
       purchase_date: form.purchase_date || null,
       location: form.location.trim() || null,
       dept_id: form.dept_id ?? null,
       remark: form.remark.trim() || null,
-      items: form.items.map((line) => {
-        const base = line.base_asset_no.trim()
-        return {
-          category_id: line.category_id as number,
-          model_id: line.model_id ?? null,
-          name: line.name.trim(),
-          quantity: line.quantity,
-          base_asset_no: base || null,
-          asset_nos:
-            base && line.codes_edited
-              ? line.asset_nos.map((code) => code.trim())
-              : null,
-          unit_price: line.unit_price ?? null,
-          warranty_end: line.warranty_end || null,
-          remark: line.remark.trim() || null,
-        }
-      }),
-    })
-    ElMessage.success('入库单已创建，资产编码已预占，确认后生成资产台账')
+      items,
+    }
+    let saved: Inbound
+    if (createMode.value === 'edit' && editingId.value) {
+      saved = await inboundApi.update(editingId.value, {
+        ...payload,
+        version: editingVersion.value,
+      })
+      ElMessage.success('入库单已更新，编码已重新预占')
+    } else {
+      saved = await inboundApi.create({
+        ...payload,
+        source_inbound_id: sourceInboundId.value,
+      })
+      ElMessage.success(
+        createMode.value === 'supplement'
+          ? '补录入库单已创建，确认后生成补录资产'
+          : '入库单已创建，资产编码已预占，确认后生成资产台账',
+      )
+    }
     createVisible.value = false
     clearPreviewTimers()
-    detailItem.value = created
+    detailItem.value = saved
     detailVisible.value = true
     handleSearch()
   } finally {
@@ -493,6 +618,54 @@ async function cancelInbound(row: Inbound): Promise<void> {
   ElMessage.success('入库单已取消')
   if (detailItem.value?.id === row.id) detailVisible.value = false
   await fetchRows()
+}
+
+async function openReverse(row: Inbound): Promise<void> {
+  const detail = await inboundApi.get(row.id)
+  if (!detail.assets.some((item) => item.can_reverse)) {
+    ElMessage.warning('该入库单当前没有可冲销的在库资产')
+    return
+  }
+  reverseItem.value = detail
+  reverseReason.value = ''
+  reverseSelected.value = []
+  reverseVisible.value = true
+}
+
+function reverseSelectable(row: InboundAsset): boolean {
+  return row.can_reverse
+}
+
+function handleReverseSelection(rows: InboundAsset[]): void {
+  reverseSelected.value = rows
+}
+
+async function submitReverse(): Promise<void> {
+  const item = reverseItem.value
+  if (!item) return
+  if (!reverseSelected.value.length) {
+    ElMessage.warning('请勾选要冲销的资产')
+    return
+  }
+  const reason = reverseReason.value.trim()
+  if (!reason) {
+    ElMessage.warning('请填写冲销原因')
+    return
+  }
+  reverseSubmitting.value = true
+  try {
+    const updated = await inboundApi.reverseAssets(item.id, {
+      asset_nos: reverseSelected.value.map((asset) => asset.asset_no),
+      reason,
+      version: item.version,
+    })
+    ElMessage.success('所选资产已冲销作废，编码已释放')
+    reverseVisible.value = false
+    if (detailItem.value?.id === updated.id) detailItem.value = updated
+    await fetchRows()
+  } finally {
+    reverseSubmitting.value = false
+  }
 }
 
 onMounted(async () => {
@@ -611,9 +784,12 @@ onBeforeUnmount(clearPreviewTimers)
         <el-table-column label="创建人" min-width="120">
           <template #default="{ row }">{{ row.created_by_name || '—' }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="220" fixed="right">
+        <el-table-column label="操作" width="340" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" @click="openDetail(row)">详情</el-button>
+            <el-button v-if="row.can_edit" link type="primary" @click="openEdit(row)">
+              编辑
+            </el-button>
             <el-button
               v-if="row.can_confirm"
               link
@@ -621,6 +797,22 @@ onBeforeUnmount(clearPreviewTimers)
               @click="openConfirm(row)"
             >
               确认入库
+            </el-button>
+            <el-button
+              v-if="row.can_reverse || (row.status === 'COMPLETED' && canConfirm)"
+              link
+              type="danger"
+              @click="openReverse(row)"
+            >
+              冲销资产
+            </el-button>
+            <el-button
+              v-if="row.can_supplement"
+              link
+              type="warning"
+              @click="openSupplement(row)"
+            >
+              补录
             </el-button>
             <el-button v-if="row.can_cancel" link type="warning" @click="cancelInbound(row)">
               取消
@@ -645,11 +837,27 @@ onBeforeUnmount(clearPreviewTimers)
 
     <el-dialog
       v-model="createVisible"
-      title="新建入库单"
+      :title="createTitle"
       width="1200px"
       destroy-on-close
       @closed="clearPreviewTimers"
     >
+      <el-alert
+        v-if="createMode === 'edit'"
+        type="info"
+        :closable="false"
+        show-icon
+        class="mode-alert"
+        title="仅待确认入库单可编辑；保存后原编码预占将被释放并按最新规则重新预占，确认入库时才生成资产台账。"
+      />
+      <el-alert
+        v-else-if="createMode === 'supplement'"
+        type="warning"
+        :closable="false"
+        show-icon
+        class="mode-alert"
+        title="补录单关联原入库单，用于补足数量缺口；编码按规则顺延或手工指定，原单据与历史记录不会被修改。"
+      />
       <el-form label-position="top">
         <div class="form-grid">
           <el-form-item label="入库类型">
@@ -868,12 +1076,16 @@ onBeforeUnmount(clearPreviewTimers)
         type="info"
         :closable="false"
         show-icon
-        title="创建后为待确认状态；确认入库时会在事务内生成全部资产并写入历史记录，任一步失败则整体回滚"
+        :title="
+          createMode === 'edit'
+            ? '保存后仍为待确认状态；确认入库时会在事务内生成全部资产并写入历史记录，任一步失败则整体回滚'
+            : '创建后为待确认状态；确认入库时会在事务内生成全部资产并写入历史记录，任一步失败则整体回滚'
+        "
       />
       <template #footer>
         <el-button @click="createVisible = false">取消</el-button>
         <el-button type="primary" :loading="createSubmitting" @click="submitCreate">
-          创建入库单
+          {{ createSubmitText }}
         </el-button>
       </template>
     </el-dialog>
@@ -973,6 +1185,39 @@ onBeforeUnmount(clearPreviewTimers)
           </el-table-column>
         </el-table>
 
+        <div v-if="detailItem.status === 'COMPLETED' && detailItem.assets.length" class="detail-subtitle">
+          已生成资产
+        </div>
+        <el-table
+          v-if="detailItem.status === 'COMPLETED' && detailItem.assets.length"
+          :data="detailItem.assets"
+          size="small"
+          border
+        >
+          <el-table-column label="资产编码" min-width="160">
+            <template #default="{ row }">
+              <span class="mono">{{ row.asset_no }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column prop="name" label="资产名称" min-width="160" />
+          <el-table-column label="状态" width="110">
+            <template #default="{ row }">
+              <el-tag
+                :type="row.can_reverse ? 'success' : 'info'"
+                size="small"
+                effect="light"
+              >
+                {{ row.status_label }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="可冲销" width="90">
+            <template #default="{ row }">
+              {{ row.can_reverse ? '是' : '否' }}
+            </template>
+          </el-table-column>
+        </el-table>
+
         <div class="detail-total">
           合计 <strong>{{ detailItem.total_quantity }}</strong> 台/件 ·
           <strong>{{ money(detailItem.total_amount) }}</strong>
@@ -980,6 +1225,30 @@ onBeforeUnmount(clearPreviewTimers)
       </template>
       <template #footer>
         <el-button @click="detailVisible = false">关闭</el-button>
+        <el-button
+          v-if="detailItem?.can_edit"
+          type="primary"
+          plain
+          @click="detailItem && openEdit(detailItem)"
+        >
+          编辑入库单
+        </el-button>
+        <el-button
+          v-if="detailItem?.can_supplement"
+          type="warning"
+          plain
+          @click="detailItem && openSupplement(detailItem)"
+        >
+          补录入库
+        </el-button>
+        <el-button
+          v-if="detailItem?.can_reverse"
+          type="danger"
+          plain
+          @click="detailItem && openReverse(detailItem)"
+        >
+          冲销资产
+        </el-button>
         <el-button
           v-if="detailItem?.can_cancel"
           type="warning"
@@ -1035,6 +1304,85 @@ onBeforeUnmount(clearPreviewTimers)
         <el-button @click="confirmVisible = false">取消</el-button>
         <el-button type="primary" :loading="confirmSubmitting" @click="submitConfirm">
           确认入库
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="reverseVisible" title="冲销入库资产" width="760px">
+      <template v-if="reverseItem">
+        <div class="action-summary">
+          <div>
+            <span>{{ reverseItem.inbound_no }}</span>
+            <small>
+              仅「在库」且无处理中业务的资产可冲销；冲销后资产作废、编码释放，原入库单与历史保留。
+            </small>
+          </div>
+          <el-tag :type="reverseItem.status_tag_type" effect="light">
+            {{ reverseItem.status_label }}
+          </el-tag>
+        </div>
+
+        <el-table
+          :data="reverseItem.assets"
+          size="small"
+          border
+          max-height="320"
+          @selection-change="handleReverseSelection"
+        >
+          <el-table-column type="selection" width="46" :selectable="reverseSelectable" />
+          <el-table-column label="资产编码" min-width="160">
+            <template #default="{ row }">
+              <span class="mono">{{ row.asset_no }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column prop="name" label="资产名称" min-width="160" />
+          <el-table-column label="状态" width="110">
+            <template #default="{ row }">
+              <el-tag
+                :type="row.can_reverse ? 'success' : 'info'"
+                size="small"
+                effect="light"
+              >
+                {{ row.status_label }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="可冲销" width="90">
+            <template #default="{ row }">
+              {{ row.can_reverse ? '是' : '否' }}
+            </template>
+          </el-table-column>
+        </el-table>
+
+        <el-form label-position="top" class="reverse-form">
+          <el-form-item label="冲销原因（必填）">
+            <el-input
+              v-model="reverseReason"
+              type="textarea"
+              :rows="3"
+              maxlength="500"
+              show-word-limit
+              placeholder="如：入库数量多录 1 台，冲销多余资产"
+            />
+          </el-form-item>
+        </el-form>
+
+        <el-alert
+          type="warning"
+          :closable="false"
+          show-icon
+          title="冲销会将该资产置为已作废并写入状态快照与审计日志；已领用、借用或维修中的资产需先归还或处理至在库状态。"
+        />
+      </template>
+      <template #footer>
+        <el-button @click="reverseVisible = false">取消</el-button>
+        <el-button
+          type="danger"
+          :loading="reverseSubmitting"
+          :disabled="!reverseSelected.length"
+          @click="submitReverse"
+        >
+          确认冲销（{{ reverseSelected.length }}）
         </el-button>
       </template>
     </el-dialog>
@@ -1101,6 +1449,14 @@ onBeforeUnmount(clearPreviewTimers)
 
 .full-width {
   width: 100%;
+}
+
+.mode-alert {
+  margin-bottom: 14px;
+}
+
+.reverse-form {
+  margin-top: 16px;
 }
 
 .form-grid {

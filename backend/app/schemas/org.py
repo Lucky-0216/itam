@@ -187,6 +187,7 @@ class UserOut(BaseModel):
     avatar: str | None = None
     dept_id: int | None = None
     dept_name: str | None = None
+    dept_path: str | None = None
     position: str | None = None
     status: int
     source: str = "local"

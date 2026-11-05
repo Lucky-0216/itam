@@ -7,6 +7,7 @@ class AssetStatus:
     REPAIRING = "REPAIRING"
     PENDING_SCRAP = "PENDING_SCRAP"
     SCRAPPED = "SCRAPPED"
+    VOIDED = "VOIDED"
 
 
 ASSET_STATUS_LABELS = {
@@ -18,6 +19,7 @@ ASSET_STATUS_LABELS = {
     AssetStatus.REPAIRING: "维修中",
     AssetStatus.PENDING_SCRAP: "待报废",
     AssetStatus.SCRAPPED: "已报废",
+    AssetStatus.VOIDED: "已作废",
 }
 
 ASSET_STATUS_TAG_TYPES = {
@@ -29,6 +31,7 @@ ASSET_STATUS_TAG_TYPES = {
     AssetStatus.REPAIRING: "warning",
     AssetStatus.PENDING_SCRAP: "danger",
     AssetStatus.SCRAPPED: "info",
+    AssetStatus.VOIDED: "info",
 }
 
 

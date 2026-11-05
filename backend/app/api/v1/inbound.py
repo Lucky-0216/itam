@@ -8,6 +8,8 @@ from app.schemas.inbound import (
     InboundCancelPayload,
     InboundConfirmPayload,
     InboundCreate,
+    InboundReversePayload,
+    InboundUpdate,
 )
 from app.services.inbound_service import InboundService
 from app.services.permission_service import AuthContext
@@ -94,6 +96,35 @@ async def inbound_detail(
 ):
     result = await InboundService(session).get_inbound(inbound_id, context)
     return ok(result.model_dump(mode="json"))
+
+
+@router.put("/inbounds/{inbound_id}", summary="修改待确认入库单")
+async def update_inbound(
+    inbound_id: int,
+    payload: InboundUpdate,
+    context: AuthContext = Depends(require_perm("asset:inbound:create")),
+    session: AsyncSession = Depends(get_db),
+):
+    result = await InboundService(session).update_inbound(
+        inbound_id, payload, context
+    )
+    return ok(result.model_dump(mode="json"), message="入库单已更新")
+
+
+@router.post("/inbounds/{inbound_id}/reverse-assets", summary="冲销已入库资产")
+async def reverse_inbound_assets(
+    inbound_id: int,
+    payload: InboundReversePayload,
+    context: AuthContext = Depends(require_perm("asset:inbound:confirm")),
+    session: AsyncSession = Depends(get_db),
+):
+    result = await InboundService(session).reverse_assets(
+        inbound_id, payload, context
+    )
+    return ok(
+        result.model_dump(mode="json"),
+        message="所选资产已冲销作废，编码已释放",
+    )
 
 
 @router.post("/inbounds/{inbound_id}/confirm", summary="确认入库")
