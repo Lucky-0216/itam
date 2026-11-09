@@ -25,6 +25,9 @@ import { useAuthStore } from '@/stores/auth'
 import type {
   AssetCategory,
   AssetCategoryType,
+  AssetDomain,
+  AssetDomainItem,
+  AssetDomainPayload,
   AssetFieldType,
   AssetModel,
   CategoryField,
@@ -37,6 +40,7 @@ import {
 } from '@/types/asset'
 
 const auth = useAuthStore()
+const domains = ref<AssetDomainItem[]>([])
 
 const treeRef = ref<InstanceType<typeof ElTree>>()
 const categories = ref<AssetCategory[]>([])
@@ -65,6 +69,94 @@ const canManageModel = computed(
     auth.hasPerm('asset:model:update') ||
     auth.hasPerm('asset:model:delete'),
 )
+
+const domainDialogVisible = ref(false)
+const domainFormVisible = ref(false)
+const domainFormMode = ref<'create' | 'edit'>('create')
+const domainSubmitting = ref(false)
+const domainFormRef = ref<FormInstance>()
+const domainForm = reactive({
+  id: 0,
+  code: '',
+  name: '',
+  sort: 100,
+})
+const domainRules: FormRules = {
+  code: [
+    { required: true, message: '请输入资产域编码', trigger: 'blur' },
+    {
+      pattern: /^[A-Z][A-Z0-9_]{0,19}$/,
+      message: '1-20 位大写字母、数字或下划线，且以字母开头',
+      trigger: 'blur',
+    },
+  ],
+  name: [{ required: true, message: '请输入资产域名称', trigger: 'blur' }],
+}
+
+async function loadDomains(): Promise<void> {
+  domains.value = await assetApi.listDomains()
+}
+
+function openCreateDomain(): void {
+  domainFormMode.value = 'create'
+  Object.assign(domainForm, { id: 0, code: '', name: '', sort: 100 })
+  domainFormVisible.value = true
+  void nextTick(() => domainFormRef.value?.clearValidate())
+}
+
+function openEditDomain(domain: AssetDomainItem): void {
+  domainFormMode.value = 'edit'
+  Object.assign(domainForm, {
+    id: domain.id,
+    code: domain.code,
+    name: domain.name,
+    sort: domain.sort,
+  })
+  domainFormVisible.value = true
+  void nextTick(() => domainFormRef.value?.clearValidate())
+}
+
+async function submitDomain(): Promise<void> {
+  const valid = await domainFormRef.value?.validate().catch(() => false)
+  if (!valid || domainSubmitting.value) return
+  domainSubmitting.value = true
+  try {
+    if (domainFormMode.value === 'create') {
+      const payload: AssetDomainPayload = {
+        code: domainForm.code.trim().toUpperCase(),
+        name: domainForm.name.trim(),
+        sort: domainForm.sort,
+      }
+      await assetApi.createDomain(payload)
+      ElMessage.success('资产域创建成功')
+    } else {
+      await assetApi.updateDomain(domainForm.id, {
+        name: domainForm.name.trim(),
+        sort: domainForm.sort,
+      })
+      ElMessage.success('资产域已更新')
+    }
+    domainFormVisible.value = false
+    await loadDomains()
+  } finally {
+    domainSubmitting.value = false
+  }
+}
+
+async function deleteDomain(domain: AssetDomainItem): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      `确定删除资产域「${domain.name}（${domain.code}）」吗？被分类或角色引用的资产域不能删除。`,
+      '删除资产域',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  await assetApi.deleteDomain(domain.id)
+  ElMessage.success('资产域已删除')
+  await loadDomains()
+}
 
 function flattenCategories(nodes: AssetCategory[]): AssetCategory[] {
   return nodes.flatMap((node) => [node, ...flattenCategories(node.children ?? [])])
@@ -100,6 +192,14 @@ watch(treeKeyword, (value) => {
 
 function categoryTypeLabel(type: AssetCategoryType): string {
   return CATEGORY_TYPE_LABELS[type] ?? type
+}
+
+function assetDomainLabel(domain: string): string {
+  return domains.value.find((item) => item.code === domain)?.name ?? domain
+}
+
+function assetDomainTag(domain: string): 'warning' | 'info' {
+  return domain === 'ADMIN' ? 'warning' : 'info'
 }
 
 function categoryTypeTag(type: AssetCategoryType): 'primary' | 'success' | 'warning' | 'info' {
@@ -147,7 +247,7 @@ async function loadModels(): Promise<void> {
 }
 
 async function refreshAll(): Promise<void> {
-  await Promise.all([loadTree(), loadModels()])
+  await Promise.all([loadDomains(), loadTree(), loadModels()])
 }
 
 const importVisible = ref(false)
@@ -225,6 +325,7 @@ interface CategoryFormState {
   name: string
   code: string
   category_type: AssetCategoryType
+  asset_domain: AssetDomain
   sort: number
   safety_stock: number
   status: number
@@ -238,6 +339,7 @@ const categoryForm = reactive<CategoryFormState>({
   name: '',
   code: '',
   category_type: 'HARDWARE',
+  asset_domain: '',
   sort: 0,
   safety_stock: 0,
   status: 1,
@@ -259,6 +361,7 @@ const categoryRules: FormRules = {
     },
   ],
   category_type: [{ required: true, message: '请选择资产类型', trigger: 'change' }],
+  asset_domain: [{ required: true, message: '请选择资产域', trigger: 'change' }],
 }
 
 const parentTreeData = computed(() => {
@@ -273,6 +376,22 @@ const parentTreeData = computed(() => {
 })
 
 const categoryTypeLocked = computed(() => categoryForm.parent_id !== null)
+const categoryDomainLocked = computed(
+  () =>
+    categoryForm.parent_id !== null ||
+    (categoryDialogMode.value === 'edit' && !auth.isSuperAdmin),
+)
+
+watch(
+  () => categoryForm.parent_id,
+  (parentId) => {
+    if (parentId === null) return
+    const parent = findCategory(categories.value, parentId)
+    if (!parent) return
+    categoryForm.category_type = parent.category_type
+    categoryForm.asset_domain = parent.asset_domain
+  },
+)
 
 function resetCategoryForm(): void {
   categoryForm.id = null
@@ -280,6 +399,7 @@ function resetCategoryForm(): void {
   categoryForm.name = ''
   categoryForm.code = ''
   categoryForm.category_type = 'HARDWARE'
+  categoryForm.asset_domain = domains.value[0]?.code ?? ''
   categoryForm.sort = 0
   categoryForm.safety_stock = 0
   categoryForm.status = 1
@@ -294,6 +414,7 @@ function openCreateCategory(parent: AssetCategory | null = null): void {
   if (parent) {
     categoryForm.parent_id = parent.id
     categoryForm.category_type = parent.category_type
+    categoryForm.asset_domain = parent.asset_domain
   }
   categoryDialogVisible.value = true
 }
@@ -306,6 +427,7 @@ function openEditCategory(category: AssetCategory): void {
   categoryForm.name = category.name
   categoryForm.code = category.code
   categoryForm.category_type = category.category_type
+  categoryForm.asset_domain = category.asset_domain
   categoryForm.sort = category.sort
   categoryForm.safety_stock = category.safety_stock
   categoryForm.status = category.status
@@ -330,6 +452,7 @@ async function submitCategory(): Promise<void> {
       name: categoryForm.name.trim(),
       code: categoryForm.code.trim().toUpperCase(),
       category_type: resolveCategoryType(),
+      asset_domain: categoryForm.parent_id === null ? categoryForm.asset_domain : null,
       sort: categoryForm.sort,
       safety_stock: categoryForm.safety_stock,
       status: categoryForm.status,
@@ -341,9 +464,33 @@ async function submitCategory(): Promise<void> {
       targetId = created.id
       ElMessage.success('分类创建成功')
     } else if (categoryForm.id !== null) {
+      const original = findCategory(categories.value, categoryForm.id)
+      const parent =
+        categoryForm.parent_id === null
+          ? null
+          : findCategory(categories.value, categoryForm.parent_id)
+      const targetDomain = parent?.asset_domain ?? categoryForm.asset_domain
+      let confirmDomainChange = false
+      if (original && targetDomain !== original.asset_domain) {
+        if (!auth.isSuperAdmin) {
+          ElMessage.warning('仅超级管理员可跨域调整分类')
+          return
+        }
+        try {
+          await ElMessageBox.confirm(
+            `分类「${original.name}」将从「${assetDomainLabel(original.asset_domain)}」调整到「${assetDomainLabel(targetDomain)}」，全部子分类同步变更并写入专项审计。确定继续吗？`,
+            '跨域调整分类',
+            { type: 'warning', confirmButtonText: '确认调整', cancelButtonText: '取消' },
+          )
+          confirmDomainChange = true
+        } catch {
+          return
+        }
+      }
       await assetApi.updateCategory(categoryForm.id, {
         ...payload,
         version: categoryForm.version,
+        confirm_domain_change: confirmDomainChange,
       })
       ElMessage.success('分类更新成功')
     }
@@ -548,6 +695,7 @@ const modelDialogVisible = ref(false)
 const modelDialogMode = ref<'create' | 'edit'>('create')
 const modelSubmitting = ref(false)
 const modelFormRef = ref<FormInstance>()
+const originalModelDomain = ref<AssetDomain | null>(null)
 
 interface ModelFormState {
   id: number | null
@@ -593,9 +741,21 @@ const modelRules: FormRules = {
   unit: [{ required: true, message: '请输入计量单位', trigger: 'blur' }],
 }
 
+const modelCategoryTree = computed(() => {
+  if (
+    modelDialogMode.value !== 'edit' ||
+    auth.isSuperAdmin ||
+    originalModelDomain.value === null
+  ) {
+    return categories.value
+  }
+  return categories.value.filter((node) => node.asset_domain === originalModelDomain.value)
+})
+
 function resetModelForm(): void {
   modelForm.id = null
   modelForm.category_id = selectedId.value
+  originalModelDomain.value = null
   modelForm.name = ''
   modelForm.code = ''
   modelForm.brand = ''
@@ -620,6 +780,8 @@ function openEditModel(model: AssetModel): void {
   modelDialogMode.value = 'edit'
   modelForm.id = model.id
   modelForm.category_id = model.category_id
+  originalModelDomain.value =
+    findCategory(categories.value, model.category_id)?.asset_domain ?? null
   modelForm.name = model.name
   modelForm.code = model.code
   modelForm.brand = model.brand ?? ''
@@ -654,9 +816,32 @@ async function submitModel(): Promise<void> {
       await assetApi.createModel(payload)
       ElMessage.success('型号创建成功')
     } else if (modelForm.id !== null) {
+      const targetDomain = findCategory(categories.value, modelForm.category_id)?.asset_domain
+      let confirmDomainChange = false
+      if (
+        originalModelDomain.value !== null &&
+        targetDomain !== undefined &&
+        targetDomain !== originalModelDomain.value
+      ) {
+        if (!auth.isSuperAdmin) {
+          ElMessage.warning('仅超级管理员可跨域调整型号所属分类')
+          return
+        }
+        try {
+          await ElMessageBox.confirm(
+            `型号「${modelForm.name}」将从「${assetDomainLabel(originalModelDomain.value)}」调整到「${assetDomainLabel(targetDomain)}」，并写入专项审计。确定继续吗？`,
+            '跨域调整型号',
+            { type: 'warning', confirmButtonText: '确认调整', cancelButtonText: '取消' },
+          )
+          confirmDomainChange = true
+        } catch {
+          return
+        }
+      }
       await assetApi.updateModel(modelForm.id, {
         ...payload,
         version: modelForm.version,
+        confirm_domain_change: confirmDomainChange,
       })
       ElMessage.success('型号更新成功')
     }
@@ -685,6 +870,9 @@ onMounted(() => {
       <div class="page-actions">
         <el-button :icon="Refresh" :loading="treeLoading || modelLoading" @click="refreshAll">
           刷新数据
+        </el-button>
+        <el-button v-if="auth.isSuperAdmin" :icon="Setting" @click="domainDialogVisible = true">
+          资产域管理
         </el-button>
         <el-button v-if="canCreateCategory" :icon="Upload" @click="importVisible = true">
           导入分类
@@ -755,6 +943,13 @@ onMounted(() => {
                       :type="categoryTypeTag(data.category_type)"
                     >
                       {{ categoryTypeLabel(data.category_type) }}
+                    </el-tag>
+                    <el-tag
+                      size="small"
+                      effect="plain"
+                      :type="assetDomainTag(data.asset_domain)"
+                    >
+                      {{ assetDomainLabel(data.asset_domain) }}
                     </el-tag>
                     <span class="category-code">{{ data.code }}</span>
                     <span class="category-stats">
@@ -1030,6 +1225,29 @@ onMounted(() => {
             子分类自动继承父级资产类型
           </p>
         </el-form-item>
+        <el-form-item label="资产域" prop="asset_domain">
+          <el-select
+            v-model="categoryForm.asset_domain"
+            :disabled="categoryDomainLocked"
+            class="full-width"
+          >
+            <el-option
+              v-for="domain in domains"
+              :key="domain.code"
+              :label="domain.name"
+              :value="domain.code"
+            />
+          </el-select>
+          <p v-if="categoryForm.parent_id !== null" class="form-tip">
+            子分类自动继承根分类的资产域
+          </p>
+          <p v-else-if="categoryDomainLocked" class="form-tip">
+            仅超级管理员可调整已有分类的资产域
+          </p>
+          <p v-else class="form-tip">
+            根分类决定整棵分类树的业务域，跨域修改需二次确认并同步全部子分类
+          </p>
+        </el-form-item>
         <div class="form-row">
           <el-form-item label="排序">
             <el-input-number v-model="categoryForm.sort" :min="0" :max="9999" controls-position="right" />
@@ -1251,7 +1469,7 @@ onMounted(() => {
         <el-form-item label="所属分类" prop="category_id">
           <el-tree-select
             v-model="modelForm.category_id"
-            :data="categories"
+            :data="modelCategoryTree"
             :props="{ label: 'name', children: 'children' }"
             node-key="id"
             check-strictly
@@ -1331,6 +1549,78 @@ onMounted(() => {
         <el-button @click="modelDialogVisible = false">取消</el-button>
         <el-button type="primary" :loading="modelSubmitting" @click="submitModel">
           {{ modelDialogMode === 'create' ? '创建型号' : '保存修改' }}
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="domainDialogVisible" title="资产域管理" width="680px">
+      <div class="panel-head">
+        <p class="form-tip">
+          资产域在角色级一次授权后作用于全部资产业务；内置域不可删除，被分类或角色引用的域不可删除。
+        </p>
+        <el-button type="primary" plain size="small" :icon="Plus" @click="openCreateDomain">
+          新增资产域
+        </el-button>
+      </div>
+      <el-table :data="domains" row-key="id" size="small" border>
+        <el-table-column label="编码" prop="code" width="130" />
+        <el-table-column label="名称" prop="name" min-width="150" />
+        <el-table-column label="排序" prop="sort" width="80" align="center" />
+        <el-table-column label="类型" width="90" align="center">
+          <template #default="{ row }">
+            <el-tag :type="row.is_builtin ? 'info' : 'success'" size="small" effect="plain">
+              {{ row.is_builtin ? '内置' : '自定义' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="110" align="center">
+          <template #default="{ row }">
+            <el-button text :icon="Edit" @click="openEditDomain(row)" />
+            <el-button
+              text
+              type="danger"
+              :icon="Delete"
+              :disabled="row.is_builtin"
+              @click="deleteDomain(row)"
+            />
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-dialog>
+
+    <el-dialog
+      v-model="domainFormVisible"
+      :title="domainFormMode === 'create' ? '新增资产域' : '编辑资产域'"
+      width="460px"
+      destroy-on-close
+    >
+      <el-form
+        ref="domainFormRef"
+        :model="domainForm"
+        :rules="domainRules"
+        label-width="92px"
+        class="dialog-form"
+      >
+        <el-form-item label="域编码" prop="code">
+          <el-input
+            v-model="domainForm.code"
+            maxlength="20"
+            :disabled="domainFormMode === 'edit'"
+            placeholder="例如 FACILITY"
+            @input="domainForm.code = String($event).toUpperCase()"
+          />
+        </el-form-item>
+        <el-form-item label="域名称" prop="name">
+          <el-input v-model="domainForm.name" maxlength="50" placeholder="例如 设施资产" />
+        </el-form-item>
+        <el-form-item label="排序">
+          <el-input-number v-model="domainForm.sort" :min="0" :max="9999" controls-position="right" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="domainFormVisible = false">取消</el-button>
+        <el-button type="primary" :loading="domainSubmitting" @click="submitDomain">
+          {{ domainFormMode === 'create' ? '创建资产域' : '保存修改' }}
         </el-button>
       </template>
     </el-dialog>

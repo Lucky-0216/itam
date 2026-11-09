@@ -49,35 +49,37 @@ class SearchService:
         limit: int,
     ) -> list[SearchItemOut]:
         conditions = await asset_scope_conditions(self.session, context)
+        matchers = [Asset.asset_no.ilike(pattern, escape="\\")]
+        if context.can_view_field("asset", "serial_no"):
+            matchers.append(Asset.serial_no.ilike(pattern, escape="\\"))
         stmt = (
             select(Asset)
-            .where(
-                *conditions,
-                or_(
-                    Asset.asset_no.ilike(pattern, escape="\\"),
-                    Asset.serial_no.ilike(pattern, escape="\\"),
-                ),
-            )
+            .where(*conditions, or_(*matchers))
             .order_by(Asset.id.desc())
             .limit(limit)
         )
         assets = (await self.session.execute(stmt)).scalars().all()
         results: list[SearchItemOut] = []
+        name_visible = context.can_view_field("asset", "name")
+        custodian_visible = context.can_view_field("asset", "custodian_id")
         for asset in assets:
             subtitle = " · ".join(
                 part
                 for part in [
                     asset.category.name if asset.category else None,
                     ASSET_STATUS_LABELS.get(asset.status, asset.status),
-                    asset.custodian.real_name if asset.custodian else None,
+                    asset.custodian.real_name
+                    if custodian_visible and asset.custodian
+                    else None,
                 ]
                 if part
             )
+            name = asset.name if name_visible else "已隐藏"
             results.append(
                 SearchItemOut(
                     type="asset",
                     id=asset.id,
-                    title=f"{asset.name} · {asset.asset_no}",
+                    title=f"{name} · {asset.asset_no}",
                     subtitle=subtitle or None,
                     keyword=asset.asset_no,
                 )
@@ -91,8 +93,6 @@ class SearchService:
         limit: int,
     ) -> list[SearchItemOut]:
         allowed = await scoped_dept_ids(self.session, context)
-        if allowed is not None and not allowed:
-            return []
 
         conditions: list = [
             User.deleted_at.is_(None),

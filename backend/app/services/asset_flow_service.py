@@ -26,7 +26,6 @@ from app.core.asset_ops import SCRAP_ACTIVE_STATUSES, TRANSFER_ACTIVE_STATUSES
 from app.core.assets import ASSET_STATUS_LABELS, ASSET_STATUS_TAG_TYPES, AssetStatus
 from app.core.exceptions import BizError, ConflictError, NotFoundError, PermissionDenied
 from app.core.maintenance import MAINTENANCE_ACTIVE_STATUSES
-from app.core.permissions import DataScope
 from app.models import (
     ApprovalTask,
     Asset,
@@ -63,8 +62,16 @@ from app.services.approval_flow_service import ApprovalFlowService
 from app.services.asset_snapshot import asset_snapshot as _asset_snapshot
 from app.services.asset_snapshot import json_value as _json_value
 from app.services.audit_service import AuditService
+from app.services.dingtalk_approval import LINK_RUNNING
+from app.services import dingtalk_approval
 from app.services.permission_service import AuthContext
-from app.services.scope_service import is_self_only, scoped_dept_ids
+from app.services.scope_service import (
+    asset_domain_condition,
+    asset_scope_conditions,
+    category_domain_allowed,
+    is_self_only,
+    scoped_dept_ids,
+)
 from app.services.txn import commit_or_conflict
 
 STATUS_CONFLICT_MESSAGE = "资产状态已变更，请刷新后重试"
@@ -135,7 +142,38 @@ class AssetFlowService:
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
     async def _allowed_depts(self, context: AuthContext) -> set[int] | None:
-        return await scoped_dept_ids(self.session, context)
+        return await scoped_dept_ids(
+            self.session, context, resource="requisition"
+        )
+
+    @staticmethod
+    def _domain_condition(context: AuthContext):
+        domains = context.allowed_domains("requisition")
+        if domains is None:
+            return None
+        return AssetRequest.category_id.in_(
+            select(AssetCategory.id).where(
+                AssetCategory.asset_domain.in_(domains)
+            )
+        )
+
+    @staticmethod
+    def _in_domain(request: AssetRequest, context: AuthContext) -> bool:
+        return category_domain_allowed(
+            request.category, context, "requisition"
+        )
+
+    @staticmethod
+    def _can_read_review(context: AuthContext) -> bool:
+        return any(
+            context.has_permission(code)
+            for code in (
+                "asset:request:review",
+                "asset:request:approve",
+                "asset:outbound:view",
+                "asset:return:confirm:view",
+            )
+        )
 
     @staticmethod
     def _in_scope(
@@ -143,7 +181,13 @@ class AssetFlowService:
         context: AuthContext,
         allowed: set[int] | None,
     ) -> bool:
-        if context.is_superuser or allowed is None:
+        if not AssetFlowService._in_domain(request, context):
+            return False
+        if context.is_superuser:
+            return True
+        if is_self_only(context, "requisition"):
+            return request.applicant_id == context.user.id
+        if allowed is None:
             return True
         if request.applicant_dept_id is None:
             return False
@@ -236,15 +280,21 @@ class AssetFlowService:
         flow_description = (
             ApprovalFlowService.describe(request) if request.flow_id else None
         )
+        dingtalk = request.__dict__.get("dingtalk_approval")
+        dingtalk_running = bool(
+            dingtalk is not None and dingtalk.status == LINK_RUNNING
+        )
         if request.flow_id:
             can_review = (
                 request.status == RequestStatus.PENDING_APPROVAL
+                and not dingtalk_running
                 and context.has_permission("asset:request:approve")
                 and ApprovalFlowService.user_can_act(request, context)
             )
         else:
             can_review = (
                 request.status == RequestStatus.PENDING_APPROVAL
+                and not dingtalk_running
                 and in_scope
                 and context.has_permission("asset:request:approve")
                 and (stage or ApprovalStage.ASSET) in handled_stages
@@ -317,6 +367,11 @@ class AssetFlowService:
             approver_name=request.approver_name,
             approved_at=request.approved_at,
             approval_comment=request.approval_comment,
+            dingtalk_instance_id=(
+                dingtalk.process_instance_id if dingtalk is not None else None
+            ),
+            dingtalk_status=dingtalk.status if dingtalk is not None else None,
+            dingtalk_result=dingtalk.result if dingtalk is not None else None,
             approvals=[
                 self._approval_out(row)
                 for row in sorted(approval_rows, key=lambda item: item.step_no)
@@ -368,11 +423,15 @@ class AssetFlowService:
     def _my_actionable_condition(self, context: AuthContext):
         handled_stages = self._handled_stages(context)
         actionable = []
+        not_dingtalk = ~dingtalk_approval.running_link_exists(
+            request_id=AssetRequest.id
+        )
         if context.is_superuser:
             actionable.append(
                 and_(
                     AssetRequest.status == RequestStatus.PENDING_APPROVAL,
                     AssetRequest.flow_id.is_not(None),
+                    not_dingtalk,
                 )
             )
         else:
@@ -380,6 +439,7 @@ class AssetFlowService:
                 and_(
                     AssetRequest.status == RequestStatus.PENDING_APPROVAL,
                     AssetRequest.flow_id.is_not(None),
+                    not_dingtalk,
                     self._my_pending_task_condition(context),
                 )
             )
@@ -389,6 +449,7 @@ class AssetFlowService:
                     AssetRequest.status == RequestStatus.PENDING_APPROVAL,
                     AssetRequest.flow_id.is_(None),
                     AssetRequest.approval_stage == ApprovalStage.DEPT,
+                    not_dingtalk,
                 )
             )
         if ApprovalStage.ASSET in handled_stages:
@@ -396,6 +457,7 @@ class AssetFlowService:
                 and_(
                     AssetRequest.status == RequestStatus.PENDING_APPROVAL,
                     AssetRequest.flow_id.is_(None),
+                    not_dingtalk,
                     or_(
                         AssetRequest.approval_stage == ApprovalStage.ASSET,
                         AssetRequest.approval_stage.is_(None),
@@ -424,16 +486,22 @@ class AssetFlowService:
     ) -> AssetRequestPageOut:
         conditions = []
         allowed: set[int] | None = None
+        domain_condition = self._domain_condition(context)
+        if domain_condition is not None:
+            conditions.append(domain_condition)
 
         if view == "mine":
             conditions.append(AssetRequest.applicant_id == context.user.id)
         else:
             allowed = await self._allowed_depts(context)
-            if is_self_only(context):
+            if is_self_only(context, "requisition"):
                 conditions.append(
-                    and_(
-                        AssetRequest.flow_id.is_not(None),
-                        self._my_pending_task_condition(context),
+                    or_(
+                        AssetRequest.applicant_id == context.user.id,
+                        and_(
+                            AssetRequest.flow_id.is_not(None),
+                            self._my_pending_task_condition(context),
+                        ),
                     )
                 )
             elif allowed is not None:
@@ -502,13 +570,19 @@ class AssetFlowService:
 
     async def review_summary(self, context: AuthContext) -> AssetRequestSummaryOut:
         scope_conditions = []
-        if not context.has_permission("asset:request:review"):
+        domain_condition = self._domain_condition(context)
+        if domain_condition is not None:
+            scope_conditions.append(domain_condition)
+        if not self._can_read_review(context):
             scope_conditions.append(AssetRequest.applicant_id == context.user.id)
-        elif is_self_only(context):
+        elif is_self_only(context, "requisition"):
             scope_conditions.append(
-                and_(
-                    AssetRequest.flow_id.is_not(None),
-                    self._my_pending_task_condition(context),
+                or_(
+                    AssetRequest.applicant_id == context.user.id,
+                    and_(
+                        AssetRequest.flow_id.is_not(None),
+                        self._my_pending_task_condition(context),
+                    ),
                 )
             )
         else:
@@ -550,19 +624,27 @@ class AssetFlowService:
                     ),
                 )
             )
+        not_dingtalk = ~dingtalk_approval.running_link_exists(
+            request_id=AssetRequest.id
+        )
         legacy_pending_approval = (
             await count(
                 AssetRequest.status == RequestStatus.PENDING_APPROVAL,
                 or_(*stage_conditions),
+                not_dingtalk,
             )
             if stage_conditions
             else 0
         )
         flow_pending_condition = (
-            AssetRequest.flow_id.is_not(None)
+            and_(
+                AssetRequest.flow_id.is_not(None),
+                not_dingtalk,
+            )
             if context.is_superuser
             else and_(
                 AssetRequest.flow_id.is_not(None),
+                not_dingtalk,
                 self._my_pending_task_condition(context),
             )
         )
@@ -618,8 +700,8 @@ class AssetFlowService:
         )
 
     @staticmethod
-    def _available_conditions() -> list:
-        return [
+    def _available_conditions(context: AuthContext) -> list:
+        conditions = [
             Asset.deleted_at.is_(None),
             Asset.status == AssetStatus.IN_STOCK,
             Asset.id.notin_(
@@ -628,9 +710,14 @@ class AssetFlowService:
                 )
             ),
         ]
+        domain_condition = asset_domain_condition(context, "requisition")
+        if domain_condition is not None:
+            conditions.append(domain_condition)
+        return conditions
 
     async def _category_availability(
         self,
+        context: AuthContext,
     ) -> tuple[
         list[AssetCategory],
         dict[int, AssetCategory],
@@ -660,6 +747,15 @@ class AssetFlowService:
             reachable.append(category)
             queue.extend(all_children.get(category.id, []))
 
+        # 资产域受限时隐藏无权访问分类，避免申请入口暴露其他业务域资产
+        domains = context.allowed_domains("requisition")
+        if domains is not None:
+            reachable = [
+                category
+                for category in reachable
+                if category.asset_domain in domains
+            ]
+
         by_id = {category.id: category for category in reachable}
         children: dict[int | None, list[AssetCategory]] = {}
         for category in reachable:
@@ -668,7 +764,7 @@ class AssetFlowService:
         rows = (
             await self.session.execute(
                 select(Asset.category_id, func.count(Asset.id))
-                .where(*self._available_conditions())
+                .where(*self._available_conditions(context))
                 .group_by(Asset.category_id)
             )
         ).all()
@@ -704,9 +800,11 @@ class AssetFlowService:
         )
 
     async def category_options(
-        self, parent_id: int | None
+        self, context: AuthContext, parent_id: int | None
     ) -> list[AvailableCategoryOut]:
-        _, by_id, children, subtree_counts = await self._category_availability()
+        _, by_id, children, subtree_counts = await self._category_availability(
+            context
+        )
         if parent_id is not None and parent_id not in by_id:
             raise NotFoundError("资产分类不存在或已停用")
         return [
@@ -714,8 +812,12 @@ class AssetFlowService:
             for category in children.get(parent_id, [])
         ]
 
-    async def available_categories(self) -> list[AvailableCategoryOut]:
-        categories, _, children, subtree_counts = await self._category_availability()
+    async def available_categories(
+        self, context: AuthContext
+    ) -> list[AvailableCategoryOut]:
+        categories, _, children, subtree_counts = await self._category_availability(
+            context
+        )
         nodes = {
             category.id: self._category_node(category, children, subtree_counts)
             for category in categories
@@ -745,10 +847,14 @@ class AssetFlowService:
             ]
         return [Asset.category_id == category.id]
 
-    async def _get_available_category(self, category_id: int) -> AssetCategory:
+    async def _get_available_category(
+        self, category_id: int, context: AuthContext
+    ) -> AssetCategory:
         category = await self.session.get(AssetCategory, category_id)
         if category is None or category.status != 1:
             raise NotFoundError("资产分类不存在或已停用")
+        if not category_domain_allowed(category, context, "requisition"):
+            raise PermissionDenied("无权访问该资产分类")
         return category
 
     async def _assert_leaf_category(self, category: AssetCategory) -> None:
@@ -770,13 +876,14 @@ class AssetFlowService:
 
     async def available_models(
         self,
+        context: AuthContext,
         *,
         category_id: int,
         include_child: bool,
     ) -> list[AvailableModelOut]:
-        category = await self._get_available_category(category_id)
+        category = await self._get_available_category(category_id, context)
         conditions = [
-            *self._available_conditions(),
+            *self._available_conditions(context),
             *self._category_conditions(category, include_child),
         ]
         rows = (
@@ -847,6 +954,7 @@ class AssetFlowService:
 
     async def available_assets(
         self,
+        context: AuthContext,
         *,
         category_id: int,
         include_child: bool,
@@ -854,10 +962,10 @@ class AssetFlowService:
         page: int,
         page_size: int,
     ) -> tuple[list[AvailableAssetOut], int]:
-        category = await self._get_available_category(category_id)
+        category = await self._get_available_category(category_id, context)
 
         conditions = [
-            *self._available_conditions(),
+            *self._available_conditions(context),
             *self._category_conditions(category, include_child),
         ]
         if model_ids is not None:
@@ -914,15 +1022,19 @@ class AssetFlowService:
         )
 
     async def my_assets(self, context: AuthContext) -> list[MyAssetOut]:
+        conditions = [
+            Asset.deleted_at.is_(None),
+            Asset.custodian_id == context.user.id,
+            Asset.status.in_((AssetStatus.IN_USE, AssetStatus.BORROWED)),
+        ]
+        domain_condition = asset_domain_condition(context, "requisition")
+        if domain_condition is not None:
+            conditions.append(domain_condition)
         assets = list(
             (
                 await self.session.execute(
                     select(Asset)
-                    .where(
-                        Asset.deleted_at.is_(None),
-                        Asset.custodian_id == context.user.id,
-                        Asset.status.in_((AssetStatus.IN_USE, AssetStatus.BORROWED)),
-                    )
+                    .where(*conditions)
                     .order_by(Asset.updated_at.desc(), Asset.id.desc())
                 )
             )
@@ -1010,14 +1122,16 @@ class AssetFlowService:
         payload: AssetRequestCreate,
         context: AuthContext,
     ) -> AssetRequestOut:
-        category = await self._get_available_category(payload.category_id)
+        category = await self._get_available_category(
+            payload.category_id, context
+        )
         await self._assert_leaf_category(category)
         available_count = int(
             await self.session.scalar(
                 select(func.count())
                 .select_from(Asset)
                 .where(
-                    *self._available_conditions(),
+                    *self._available_conditions(context),
                     Asset.category_id == category.id,
                 )
             )
@@ -1028,19 +1142,29 @@ class AssetFlowService:
                 f"分类「{category.name}」下暂无可用的在库资产，请选择其他分类"
             )
 
-        engine = ApprovalFlowService(self.session)
-        flow = await engine.resolve_flow(context.user.dept_id)
-        if flow is None:
-            settings = await self._get_settings()
-            stage = (
-                ApprovalStage.DEPT
-                if settings.dept_approval_required
-                else ApprovalStage.ASSET
-            )
-            dept_approval_required = settings.dept_approval_required
-        else:
+        config = await dingtalk_approval.get_approval_config(self.session)
+        doc_type = dingtalk_approval.REQUEST_TYPE_TO_DOC_TYPE.get(payload.request_type)
+        use_dingtalk = dingtalk_approval.channel_enabled(
+            config, doc_type, context.user
+        )
+        if use_dingtalk:
+            flow = None
             stage = None
             dept_approval_required = False
+        else:
+            engine = ApprovalFlowService(self.session)
+            flow = await engine.resolve_flow(context.user.dept_id)
+            if flow is None:
+                settings = await self._get_settings()
+                stage = (
+                    ApprovalStage.DEPT
+                    if settings.dept_approval_required
+                    else ApprovalStage.ASSET
+                )
+                dept_approval_required = settings.dept_approval_required
+            else:
+                stage = None
+                dept_approval_required = False
         request = AssetRequest(
             request_no=await self._next_request_no(payload.request_type),
             request_type=payload.request_type,
@@ -1060,7 +1184,35 @@ class AssetFlowService:
         self.session.add(request)
         await self.session.flush()
         start_result = None
-        if flow is not None:
+        dingtalk_link = None
+        if use_dingtalk:
+            dingtalk_link = await dingtalk_approval.create_instance(
+                self.session,
+                config,
+                doc_type=doc_type,
+                doc_no=request.request_no,
+                title=(
+                    f"IT资产{REQUEST_TYPE_LABELS[payload.request_type]}申请："
+                    f"{request.request_no}"
+                ),
+                originator_userid=context.user.dingtalk_userid,
+                form_values=[
+                    {"name": "申请人", "value": context.user.real_name or ""},
+                    {
+                        "name": "申请部门",
+                        "value": request.applicant_dept_name or "",
+                    },
+                    {"name": "资产分类", "value": category.name},
+                    {"name": "申请事由", "value": payload.reason or ""},
+                    {
+                        "name": "预计归还日期",
+                        "value": str(payload.expected_return_date or ""),
+                    },
+                ],
+                request_id=request.id,
+            )
+            request.dingtalk_approval = dingtalk_link
+        elif flow is not None:
             start_result = await engine.start_flow(
                 request,
                 flow,
@@ -1083,7 +1235,11 @@ class AssetFlowService:
             summary=(
                 f"提交{REQUEST_TYPE_LABELS[payload.request_type]}申请："
                 f"{category.name}"
-                + (f"（审批流程：{flow.name}）" if flow is not None else "")
+                + (
+                    "（钉钉审批）"
+                    if dingtalk_link is not None
+                    else (f"（审批流程：{flow.name}）" if flow is not None else "")
+                )
             ),
             actor=context.user,
             resource_type="asset_request",
@@ -1099,6 +1255,11 @@ class AssetFlowService:
                 "current_step_no": request.current_step_no,
                 "current_approvers": (
                     start_result.current_approvers if start_result else []
+                ),
+                "dingtalk_instance_id": (
+                    dingtalk_link.process_instance_id
+                    if dingtalk_link is not None
+                    else None
                 ),
                 "applicant_name": request.applicant_name,
                 "reason": request.reason,
@@ -1120,6 +1281,10 @@ class AssetFlowService:
             raise BizError("归还单无需审批")
         if request.status != RequestStatus.PENDING_APPROVAL:
             raise BizError("当前单据不在待审批状态")
+        if await dingtalk_approval.has_running_link(
+            self.session, request_id=request.id
+        ):
+            raise BizError("该单据已提交钉钉审批，请在钉钉中处理")
         allowed = await self._allowed_depts(context)
         module = (
             "资产领用"
@@ -1246,6 +1411,10 @@ class AssetFlowService:
             raise BizError("归还单无需审批")
         if request.status != RequestStatus.PENDING_APPROVAL:
             raise BizError("当前单据不在待审批状态")
+        if await dingtalk_approval.has_running_link(
+            self.session, request_id=request.id
+        ):
+            raise BizError("该单据已提交钉钉审批，请在钉钉中处理")
         if not comment:
             raise BizError("请填写驳回原因")
         allowed = await self._allowed_depts(context)
@@ -1459,7 +1628,7 @@ class AssetFlowService:
             raise BizError("申请分类已不存在，无法选择出库资产")
 
         conditions = [
-            *self._available_conditions(),
+            *self._available_conditions(context),
             *self._category_conditions(request.category, request.include_child),
             Asset.id.notin_(
                 select(AssetRequest.asset_id).where(
@@ -1653,6 +1822,8 @@ class AssetFlowService:
         context: AuthContext,
     ) -> AssetRequestOut:
         asset = await self._get_asset(payload.asset_id, for_update=True)
+        if not category_domain_allowed(asset.category, context, "requisition"):
+            raise PermissionDenied("无权操作该分类下的资产")
         if asset.status not in (AssetStatus.IN_USE, AssetStatus.BORROWED):
             raise BizError("当前资产不在用，无需归还")
         if asset.custodian_id != context.user.id:
@@ -1813,25 +1984,31 @@ class AssetFlowService:
     async def get_request(self, request_id: int, context: AuthContext) -> AssetRequestOut:
         request = await self._get_request(request_id)
         allowed = await self._allowed_depts(context)
-        if request.applicant_id != context.user.id and not context.is_superuser:
-            is_task_approver = bool(request.flow_id) and (
-                ApprovalFlowService.has_task_for_user(request, context.user.id)
-            )
-            if not is_task_approver:
-                if not context.has_permission("asset:request:review"):
-                    raise PermissionDenied("无权查看该业务单据")
-                self._assert_review_scope(request, context, allowed)
+        if not context.is_superuser:
+            if not self._in_domain(request, context):
+                raise PermissionDenied("无权查看该资产域下的业务单据")
+            if request.applicant_id != context.user.id:
+                is_task_approver = bool(request.flow_id) and (
+                    ApprovalFlowService.has_task_for_user(request, context.user.id)
+                )
+                if not is_task_approver:
+                    if not self._can_read_review(context):
+                        raise PermissionDenied("无权查看该业务单据")
+                    self._assert_review_scope(request, context, allowed)
         return self._request_out(request, context, allowed)
 
     async def scan(self, code: str, context: AuthContext) -> ScanAssetOut:
         normalized = code.strip()
         if not normalized:
             raise BizError("请输入资产编号或扫描二维码")
+        asset_conditions = await asset_scope_conditions(
+            self.session, context, resource="requisition"
+        )
         asset = (
             await self.session.execute(
                 select(Asset)
                 .where(
-                    Asset.deleted_at.is_(None),
+                    *asset_conditions,
                     or_(
                         Asset.asset_no == normalized,
                         Asset.serial_no == normalized,
@@ -1842,21 +2019,33 @@ class AssetFlowService:
         ).scalar_one_or_none()
         if asset is None:
             raise NotFoundError("未找到匹配的资产，请检查二维码或资产编号")
+        allowed = await self._allowed_depts(context)
+        request_conditions = [
+            AssetRequest.asset_id == asset.id,
+            AssetRequest.status.in_(ACTIVE_REQUEST_STATUSES),
+        ]
+        if is_self_only(context, "requisition"):
+            request_conditions.append(AssetRequest.applicant_id == context.user.id)
+        elif allowed is not None:
+            request_conditions.append(
+                AssetRequest.applicant_dept_id.in_(allowed)
+                if allowed
+                else false()
+            )
+        domain_condition = self._domain_condition(context)
+        if domain_condition is not None:
+            request_conditions.append(domain_condition)
         requests = list(
             (
                 await self.session.execute(
                     select(AssetRequest)
-                    .where(
-                        AssetRequest.asset_id == asset.id,
-                        AssetRequest.status.in_(ACTIVE_REQUEST_STATUSES),
-                    )
+                    .where(*request_conditions)
                     .order_by(AssetRequest.id.desc())
                 )
             )
             .scalars()
             .all()
         )
-        allowed = await self._allowed_depts(context)
         return ScanAssetOut(
             asset=self._available_out(asset),
             requests=[
@@ -1870,10 +2059,12 @@ class AssetFlowService:
         context: AuthContext,
     ) -> list[AssetHistoryOut]:
         asset = await self._get_asset(asset_id, include_deleted=True)
-        allowed = await self._allowed_depts(context)
+        allowed = await scoped_dept_ids(self.session, context, resource="asset")
         if not context.is_superuser:
-            if context.data_scope == DataScope.SELF:
-                if asset.custodian_id != context.user.id:
+            if not category_domain_allowed(asset.category, context, "asset"):
+                raise NotFoundError("资产不存在或无权访问")
+            if is_self_only(context, "asset"):
+                if context.user.id not in (asset.custodian_id, asset.created_by_id):
                     raise NotFoundError("资产不存在或无权访问")
             elif allowed is not None and asset.dept_id not in allowed:
                 raise NotFoundError("资产不存在或无权访问")

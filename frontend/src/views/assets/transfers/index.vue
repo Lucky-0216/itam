@@ -6,6 +6,7 @@ import { Plus, Refresh, Search } from '@element-plus/icons-vue'
 
 import { assetOpsApi } from '@/api/assetOps'
 import { useAuthStore } from '@/stores/auth'
+import type { TagType } from '@/types/assetFlow'
 import type {
   DeptOption,
   OpsAsset,
@@ -20,6 +21,24 @@ import {
   transferSteps,
 } from '@/types/assetOps'
 import { formatDateTime } from '@/utils/format'
+
+const DINGTALK_STATUS_META: Record<
+  NonNullable<TransferItem['dingtalk_status']>,
+  { label: string; type: TagType }
+> = {
+  RUNNING: { label: '钉钉审批中', type: 'warning' },
+  APPROVED: { label: '钉钉已通过', type: 'success' },
+  REJECTED: { label: '钉钉已驳回', type: 'danger' },
+  TERMINATED: { label: '钉钉已撤销', type: 'info' },
+}
+
+function dingtalkMeta(
+  status: TransferItem['dingtalk_status'],
+): { label: string; type: TagType } {
+  return status && DINGTALK_STATUS_META[status]
+    ? DINGTALK_STATUS_META[status]
+    : { label: '钉钉审批', type: 'info' }
+}
 
 type ActionMode = 'approve' | 'reject' | 'confirm'
 
@@ -378,9 +397,19 @@ onMounted(async () => {
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="状态" width="130">
+        <el-table-column label="状态" width="150">
           <template #default="{ row }">
-            <el-tag :type="row.status_tag_type" effect="light">{{ row.status_label }}</el-tag>
+            <div class="stack-cell">
+              <el-tag :type="row.status_tag_type" effect="light">{{ row.status_label }}</el-tag>
+              <el-tag
+                v-if="row.dingtalk_instance_id"
+                size="small"
+                :type="dingtalkMeta(row.dingtalk_status).type"
+                effect="plain"
+              >
+                {{ dingtalkMeta(row.dingtalk_status).label }}
+              </el-tag>
+            </div>
           </template>
         </el-table-column>
         <el-table-column label="操作" width="260" fixed="right">
@@ -563,6 +592,22 @@ onMounted(async () => {
             <el-tag :type="detailItem.status_tag_type" effect="light">
               {{ detailItem.status_label }}
             </el-tag>
+            <el-tag
+              v-if="detailItem.dingtalk_instance_id"
+              :type="dingtalkMeta(detailItem.dingtalk_status).type"
+              effect="plain"
+              style="margin-left: 8px"
+            >
+              {{ dingtalkMeta(detailItem.dingtalk_status).label }}
+            </el-tag>
+          </el-descriptions-item>
+          <el-descriptions-item
+            v-if="detailItem.dingtalk_instance_id"
+            label="钉钉审批"
+            :span="2"
+          >
+            <span class="mono">{{ detailItem.dingtalk_instance_id }}</span>
+            <span class="muted">（钉钉审批替代系统内审批，结果自动同步）</span>
           </el-descriptions-item>
           <el-descriptions-item label="资产">
             {{ detailItem.asset_name }}（{{ detailItem.asset_no }}）

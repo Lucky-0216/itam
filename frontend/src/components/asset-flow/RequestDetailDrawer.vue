@@ -2,7 +2,7 @@
 import { computed } from 'vue'
 
 import FlowSteps from '@/components/asset-flow/FlowSteps.vue'
-import type { AssetRequestItem } from '@/types/assetFlow'
+import type { AssetRequestItem, TagType } from '@/types/assetFlow'
 import { APPROVAL_STEP_TAG_TYPES } from '@/types/assetFlow'
 import { formatDateTime } from '@/utils/format'
 
@@ -14,6 +14,22 @@ const props = defineProps<{
 const emit = defineEmits<{
   (event: 'update:modelValue', value: boolean): void
 }>()
+
+const DINGTALK_STATUS_META: Record<
+  NonNullable<AssetRequestItem['dingtalk_status']>,
+  { label: string; type: TagType }
+> = {
+  RUNNING: { label: '钉钉审批中', type: 'warning' },
+  APPROVED: { label: '钉钉已通过', type: 'success' },
+  REJECTED: { label: '钉钉已驳回', type: 'danger' },
+  TERMINATED: { label: '钉钉已撤销', type: 'info' },
+}
+
+const hasDingTalk = computed(() => Boolean(props.request?.dingtalk_instance_id))
+const dingtalkMeta = computed(() => {
+  const status = props.request?.dingtalk_status
+  return status ? DINGTALK_STATUS_META[status] : null
+})
 
 const dueText = computed(() => {
   const request = props.request
@@ -69,14 +85,24 @@ const assetPending = computed(
           <p class="drawer-eyebrow">{{ request?.request_type_label || '业务单据' }}</p>
           <h3>{{ request?.request_no || '单据详情' }}</h3>
         </div>
-        <el-tag
-          v-if="request"
-          :type="request.status_tag_type"
-          effect="light"
-          size="large"
-        >
-          {{ request.status_label }}
-        </el-tag>
+        <div class="drawer-tags">
+          <el-tag
+            v-if="hasDingTalk"
+            :type="dingtalkMeta?.type ?? 'info'"
+            effect="light"
+            size="large"
+          >
+            {{ dingtalkMeta?.label ?? '钉钉审批' }}
+          </el-tag>
+          <el-tag
+            v-if="request"
+            :type="request.status_tag_type"
+            effect="light"
+            size="large"
+          >
+            {{ request.status_label }}
+          </el-tag>
+        </div>
       </div>
     </template>
 
@@ -101,10 +127,13 @@ const assetPending = computed(
             {{ dueText }}
           </el-descriptions-item>
           <el-descriptions-item v-if="hasApprovalFlow" label="审批流程">
-            {{ workflowText }}
+            {{ hasDingTalk ? '钉钉审批（替代系统内审批）' : workflowText }}
           </el-descriptions-item>
           <el-descriptions-item v-if="hasApprovalFlow" label="当前节点">
-            {{ currentNodeText }}
+            {{ hasDingTalk ? (dingtalkMeta?.label ?? '钉钉审批') : currentNodeText }}
+          </el-descriptions-item>
+          <el-descriptions-item v-if="hasDingTalk" label="钉钉实例" :span="2">
+            <span class="mono">{{ request.dingtalk_instance_id }}</span>
           </el-descriptions-item>
           <el-descriptions-item label="申请原因" :span="2">
             {{ request.reason || '—' }}
@@ -175,13 +204,15 @@ const assetPending = computed(
             >
               <strong>
                 {{
-                  isConfiguredFlow
-                    ? `${request.current_step_name || '审批'}处理中`
-                    : `${request.approval_stage_label || '审批'}处理中`
+                  hasDingTalk
+                    ? '钉钉审批中（请在钉钉内处理）'
+                    : isConfiguredFlow
+                      ? `${request.current_step_name || '审批'}处理中`
+                      : `${request.approval_stage_label || '审批'}处理中`
                 }}
               </strong>
               <span
-                v-if="isConfiguredFlow && request.current_approvers.length"
+                v-if="!hasDingTalk && isConfiguredFlow && request.current_approvers.length"
                 class="timeline-actor"
               >
                 待 {{ request.current_approvers.join('、') }}
@@ -297,6 +328,12 @@ const assetPending = computed(
   align-items: center;
   justify-content: space-between;
   gap: 14px;
+}
+
+.drawer-tags {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .drawer-head h3 {

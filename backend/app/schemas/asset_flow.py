@@ -186,6 +186,9 @@ class AssetRequestOut(BaseModel):
     approver_name: str | None = None
     approved_at: datetime | None = None
     approval_comment: str | None = None
+    dingtalk_instance_id: str | None = None
+    dingtalk_status: str | None = None
+    dingtalk_result: str | None = None
     approvals: list[ApprovalRecordOut] = Field(default_factory=list)
     outbound_by_name: str | None = None
     outbound_at: datetime | None = None

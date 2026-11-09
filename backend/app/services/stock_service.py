@@ -14,7 +14,7 @@ from app.schemas.inbound import (
     StockWarningOut,
 )
 from app.services.permission_service import AuthContext
-from app.services.scope_service import scoped_dept_ids
+from app.services.scope_service import asset_scope_conditions
 
 NO_LOCATION_KEY = "__none__"
 NO_LOCATION_LABEL = "未指定位置"
@@ -27,13 +27,10 @@ class StockService:
     async def _scope_conditions(
         self, context: AuthContext, *, location: str | None
     ) -> list:
-        allowed = await scoped_dept_ids(self.session, context)
-        conditions: list = [
-            Asset.deleted_at.is_(None),
-            Asset.status == AssetStatus.IN_STOCK,
-        ]
-        if allowed is not None:
-            conditions.append(Asset.dept_id.in_(allowed) if allowed else false())
+        conditions = await asset_scope_conditions(
+            self.session, context, resource="stock"
+        )
+        conditions.append(Asset.status == AssetStatus.IN_STOCK)
         if location == NO_LOCATION_KEY:
             conditions.append(Asset.location.is_(None))
         elif location:
@@ -56,15 +53,25 @@ class StockService:
                 .order_by(func.count(Asset.id).desc(), Asset.location.asc())
             )
         ).all()
+        price_visible = context.can_view_field("asset", "purchase_price")
         locations = [
             StockLocationOut(
                 location=row[0],
                 location_label=row[0] or NO_LOCATION_LABEL,
                 asset_count=int(row[1] or 0),
-                total_value=float(row[2] or 0),
+                total_value=float(row[2] or 0) if price_visible else 0.0,
             )
             for row in location_rows
         ]
+        if locations and not context.can_view_field("asset", "location"):
+            locations = [
+                StockLocationOut(
+                    location=None,
+                    location_label="位置已隐藏",
+                    asset_count=sum(item.asset_count for item in locations),
+                    total_value=sum(item.total_value for item in locations),
+                )
+            ]
 
         count_expr = func.count(Asset.id)
         warning_rows = (
@@ -148,13 +155,12 @@ class StockService:
                 conditions.append(Asset.category_id.in_(category_ids))
         if keyword:
             like = f"%{keyword.strip()}%"
-            conditions.append(
-                or_(
-                    Asset.asset_no.like(like),
-                    Asset.name.like(like),
-                    Asset.serial_no.like(like),
-                )
-            )
+            matchers = [Asset.asset_no.like(like)]
+            if context.can_view_field("asset", "name"):
+                matchers.append(Asset.name.like(like))
+            if context.can_view_field("asset", "serial_no"):
+                matchers.append(Asset.serial_no.like(like))
+            conditions.append(or_(*matchers))
         total = await self.session.scalar(
             select(func.count()).select_from(Asset).where(*conditions)
         )
@@ -171,25 +177,31 @@ class StockService:
             .scalars()
             .all()
         )
+        def visible(field: str, value):
+            return value if context.can_view_field("asset", field) else None
+
         items = [
             StockAssetOut(
                 id=asset.id,
                 asset_no=asset.asset_no,
-                name=asset.name,
+                name=asset.name
+                if context.can_view_field("asset", "name")
+                else "已隐藏",
                 category_id=asset.category_id,
                 category_name=asset.category.name if asset.category else None,
                 model_name=asset.model.name if asset.model else None,
-                serial_no=asset.serial_no,
-                location=asset.location,
+                serial_no=visible("serial_no", asset.serial_no),
+                location=visible("location", asset.location),
                 dept_id=asset.dept_id,
                 dept_name=asset.dept.name if asset.dept else None,
-                purchase_price=(
+                purchase_price=visible(
+                    "purchase_price",
                     float(asset.purchase_price)
                     if asset.purchase_price is not None
-                    else None
+                    else None,
                 ),
-                warranty_end=asset.warranty_end,
-                remark=asset.remark,
+                warranty_end=visible("warranty_end", asset.warranty_end),
+                remark=visible("remark", asset.remark),
                 created_at=asset.created_at,
             )
             for asset in rows
@@ -201,12 +213,16 @@ class StockService:
             page_size=page_size,
         )
 
-    async def categories(self) -> list[dict[str, object]]:
+    async def categories(self, context: AuthContext) -> list[dict[str, object]]:
+        conditions: list = [AssetCategory.status == 1]
+        domains = context.allowed_domains("stock")
+        if domains is not None:
+            conditions.append(AssetCategory.asset_domain.in_(domains))
         rows = (
             (
                 await self.session.execute(
                     select(AssetCategory)
-                    .where(AssetCategory.status == 1)
+                    .where(*conditions)
                     .order_by(AssetCategory.path, AssetCategory.sort, AssetCategory.id)
                 )
             )

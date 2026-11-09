@@ -25,6 +25,11 @@ export const useAuthStore = defineStore('auth', () => {
   const fieldPermissions = ref<Record<string, Record<string, FieldPermission>>>({})
   const dataScope = ref('')
   const dataScopeLabel = ref('')
+  // 资产域语义：domainScope === 'ALL' 表示显式拥有全部域；
+  // 'CUSTOM' + 空 assetDomains 表示无任何资产域权限，绝不能当作“不限”。
+  const domainScope = ref('')
+  const assetDomains = ref<string[]>([])
+  const resourceScopes = ref<Record<string, string>>({})
   const permissionsLoaded = ref(false)
   const isSuperAdmin = ref(false)
   const loadingProfile = ref(false)
@@ -55,6 +60,9 @@ export const useAuthStore = defineStore('auth', () => {
       fieldPermissions.value = currentUser.field_permissions ?? {}
       dataScope.value = currentUser.data_scope
       dataScopeLabel.value = currentUser.data_scope_label
+      domainScope.value = currentUser.domain_scope ?? ''
+      assetDomains.value = currentUser.asset_domains ?? []
+      resourceScopes.value = currentUser.resource_scopes ?? {}
       permissionsLoaded.value = true
       isSuperAdmin.value = currentUser.roles.some((role) => role.code === 'SUPER_ADMIN')
       accessToken.value = getAccessToken()
@@ -83,6 +91,9 @@ export const useAuthStore = defineStore('auth', () => {
     fieldPermissions.value = {}
     dataScope.value = ''
     dataScopeLabel.value = ''
+    domainScope.value = ''
+    assetDomains.value = []
+    resourceScopes.value = {}
     permissionsLoaded.value = false
     isSuperAdmin.value = false
   }
@@ -116,6 +127,9 @@ export const useAuthStore = defineStore('auth', () => {
     fieldPermissions,
     dataScope,
     dataScopeLabel,
+    domainScope,
+    assetDomains,
+    resourceScopes,
     permissionsLoaded,
     isSuperAdmin,
     loadingProfile,

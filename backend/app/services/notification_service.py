@@ -19,7 +19,13 @@ from app.models import (
 from app.models.base import now_cst
 from app.schemas.notification import NotificationItem, NotificationSummary
 from app.services.permission_service import AuthContext
-from app.services.scope_service import asset_scope_conditions, scoped_dept_ids
+from app.services.scope_service import (
+    asset_scope_conditions,
+    category_domain_condition,
+    contract_domain_condition,
+    is_self_only,
+    scoped_dept_ids,
+)
 
 _LEVEL_WEIGHT = {"danger": 0, "warning": 1, "info": 2}
 
@@ -30,6 +36,8 @@ class NotificationService:
 
     async def summary(self, context: AuthContext) -> NotificationSummary:
         conditions = await asset_scope_conditions(self.session, context)
+        if not context.has_permission("asset:ledger:view"):
+            conditions.append(false())
         today = now_cst().date()
         now = now_cst()
         items: list[NotificationItem] = []
@@ -92,20 +100,26 @@ class NotificationService:
             )
 
         if context.has_permission("asset:contract:view"):
-            allowed = await scoped_dept_ids(self.session, context)
+            allowed = await scoped_dept_ids(
+                self.session, context, resource="contract"
+            )
             contract_conditions: list = [
                 AssetContract.status == ContractStatus.ACTIVE
             ]
-            if allowed is not None:
-                if allowed:
-                    contract_conditions.append(
-                        or_(
-                            AssetContract.dept_id.is_(None),
-                            AssetContract.dept_id.in_(allowed),
-                        )
+            if is_self_only(context, "contract"):
+                contract_conditions.append(
+                    or_(
+                        AssetContract.owner_id == context.user.id,
+                        AssetContract.created_by_id == context.user.id,
                     )
-                else:
-                    contract_conditions.append(AssetContract.dept_id.is_(None))
+                )
+            elif allowed is not None:
+                contract_conditions.append(
+                    AssetContract.dept_id.in_(allowed) if allowed else false()
+                )
+            domain_condition = contract_domain_condition(context)
+            if domain_condition is not None:
+                contract_conditions.append(domain_condition)
             expiring_contracts = list(
                 (
                     await self.session.execute(
@@ -219,25 +233,33 @@ class NotificationService:
             AssetRequest.expected_return_date
             <= today + timedelta(days=settings.BORROW_REMINDER_DAYS),
         ]
-        if context.has_permission("asset:request:review"):
-            allowed = await scoped_dept_ids(self.session, context)
-            if allowed is None:
-                scope_condition = None
-            elif allowed:
-                scope_condition = AssetRequest.applicant_dept_id.in_(allowed)
-            else:
-                scope_condition = false()
-            if scope_condition is not None:
-                due_borrow_conditions.append(
-                    or_(
-                        AssetRequest.applicant_id == context.user.id,
-                        scope_condition,
+        if context.has_permission("asset:request:review") and not is_self_only(
+            context, "requisition"
+        ):
+            allowed = await scoped_dept_ids(
+                self.session, context, resource="requisition"
+            )
+            if allowed is not None:
+                if allowed:
+                    due_borrow_conditions.append(
+                        or_(
+                            AssetRequest.applicant_id == context.user.id,
+                            AssetRequest.applicant_dept_id.in_(allowed),
+                        )
                     )
-                )
+                else:
+                    due_borrow_conditions.append(
+                        AssetRequest.applicant_id == context.user.id
+                    )
         else:
             due_borrow_conditions.append(
                 AssetRequest.applicant_id == context.user.id
             )
+        domain_condition = category_domain_condition(
+            AssetRequest.category_id, context, "requisition"
+        )
+        if domain_condition is not None:
+            due_borrow_conditions.append(domain_condition)
         due_borrows = list(
             (
                 await self.session.execute(
@@ -286,20 +308,28 @@ class NotificationService:
             )
 
         if context.has_permission("asset:inventory:view"):
-            allowed = await scoped_dept_ids(self.session, context)
+            allowed = await scoped_dept_ids(
+                self.session, context, resource="inventory"
+            )
             inventory_conditions: list = [
                 InventoryTask.status == InventoryStatus.IN_PROGRESS,
                 InventoryTask.planned_date.is_not(None),
                 InventoryTask.planned_date
                 <= today + timedelta(days=settings.INVENTORY_REMINDER_DAYS),
             ]
-            if allowed is not None:
-                if allowed:
-                    inventory_conditions.append(
-                        InventoryTask.scope_dept_id.in_(allowed)
-                    )
-                else:
-                    inventory_conditions.append(false())
+            if is_self_only(context, "inventory"):
+                inventory_conditions.append(
+                    InventoryTask.created_by_id == context.user.id
+                )
+            elif allowed is not None:
+                inventory_conditions.append(
+                    InventoryTask.scope_dept_id.in_(allowed) if allowed else false()
+                )
+            domain_condition = category_domain_condition(
+                InventoryTask.scope_category_id, context, "inventory"
+            )
+            if domain_condition is not None:
+                inventory_conditions.append(domain_condition)
             inventory_total = int(
                 await self.session.scalar(
                     select(func.count(InventoryTask.id)).where(
@@ -380,13 +410,16 @@ class NotificationService:
 
         if context.has_permission("system:audit:view"):
             since = now - timedelta(hours=24)
+            security_conditions = [
+                AuditLog.action == "auth.login",
+                AuditLog.status == "FAILED",
+                AuditLog.created_at >= since,
+            ]
+            if is_self_only(context):
+                security_conditions.append(AuditLog.user_id == context.user.id)
             failed_logins = int(
                 await self.session.scalar(
-                    select(func.count(AuditLog.id)).where(
-                        AuditLog.action == "auth.login",
-                        AuditLog.status == "FAILED",
-                        AuditLog.created_at >= since,
-                    )
+                    select(func.count(AuditLog.id)).where(*security_conditions)
                 )
                 or 0
             )

@@ -62,7 +62,12 @@ from app.services.asset_void import (
 )
 from app.services.audit_service import AuditService
 from app.services.permission_service import AuthContext
-from app.services.scope_service import asset_scope_conditions, is_self_only, scoped_dept_ids
+from app.services.scope_service import (
+    asset_scope_conditions,
+    category_domain_allowed,
+    is_self_only,
+    scoped_dept_ids,
+)
 from app.services.txn import commit_or_conflict
 
 _ASSET_FIELD_NAMES = [item["field"] for item in ASSET_FIELD_CATALOG]
@@ -139,17 +144,21 @@ class AssetService:
         self, context: AuthContext, *, include_deleted: bool = False
     ) -> list[Any]:
         return await asset_scope_conditions(
-            self.session, context, include_deleted=include_deleted
+            self.session, context, resource="asset", include_deleted=include_deleted
         )
 
     async def _assert_dept_in_scope(self, dept_id: int | None, context: AuthContext) -> None:
-        if is_self_only(context):
+        if is_self_only(context, "asset"):
             if dept_id is not None and dept_id != context.user.dept_id:
                 raise BizError("无权将资产分配到数据范围外的部门")
             return
-        allowed = await scoped_dept_ids(self.session, context)
+        allowed = await scoped_dept_ids(self.session, context, resource="asset")
         if allowed is not None and dept_id is not None and dept_id not in allowed:
             raise BizError("无权将资产分配到数据范围外的部门")
+
+    def _assert_category_domain(self, category: AssetCategory, context: AuthContext) -> None:
+        if not category_domain_allowed(category, context, "asset"):
+            raise BizError("无权操作该资产域下的资产")
 
     async def _category_ids(
         self, category_id: int | None, include_child: bool
@@ -388,16 +397,18 @@ class AssetService:
                 conditions.append(Asset.category_id.in_(category_ids))
         if keyword:
             pattern = f"%{keyword.strip()}%"
-            conditions.append(
-                or_(
-                    Asset.asset_no.like(pattern),
-                    Asset.name.like(pattern),
-                    Asset.serial_no.like(pattern),
-                    Asset.mac_address.like(pattern),
-                    Asset.supplier.like(pattern),
-                    Asset.location.like(pattern),
-                )
-            )
+            matchers = [Asset.asset_no.like(pattern)]
+            # 不可见字段不能参与筛选，否则可用关键字逐位推断被遮蔽的内容。
+            for field_name, column in (
+                ("name", Asset.name),
+                ("serial_no", Asset.serial_no),
+                ("mac_address", Asset.mac_address),
+                ("supplier", Asset.supplier),
+                ("location", Asset.location),
+            ):
+                if context.can_view_field("asset", field_name):
+                    matchers.append(column.like(pattern))
+            conditions.append(or_(*matchers))
         if status:
             if status not in ASSET_STATUS_LABELS:
                 raise BizError("资产状态取值不正确")
@@ -421,11 +432,14 @@ class AssetService:
     async def _assert_asset_accessible(
         self, asset: Asset, context: AuthContext
     ) -> None:
-        allowed = await scoped_dept_ids(self.session, context)
-        if is_self_only(context):
-            if asset.custodian_id != context.user.id:
+        if is_self_only(context, "asset"):
+            if context.user.id not in (asset.custodian_id, asset.created_by_id):
                 raise NotFoundError("资产不存在或无权访问")
-        elif allowed is not None and asset.dept_id not in allowed:
+        else:
+            allowed = await scoped_dept_ids(self.session, context, resource="asset")
+            if allowed is not None and asset.dept_id not in allowed:
+                raise NotFoundError("资产不存在或无权访问")
+        if not category_domain_allowed(asset.category, context, "asset"):
             raise NotFoundError("资产不存在或无权访问")
 
     async def _get_accessible(
@@ -460,6 +474,7 @@ class AssetService:
         if not context.can_edit_field("asset", "name"):
             raise BizError("无权设置资产名称")
         category = await self._resolve_category(payload.category_id)
+        self._assert_category_domain(category, context)
         model = await self._resolve_model(payload.model_id, category)
         dept = await self._resolve_dept(payload.dept_id)
         custodian = await self._resolve_custodian(payload.custodian_id)
@@ -467,7 +482,9 @@ class AssetService:
             dept = custodian.dept
             payload.dept_id = custodian.dept_id
         await self._assert_dept_in_scope(dept.id if dept else None, context)
-        if is_self_only(context) and (custodian is None or custodian.id != context.user.id):
+        if is_self_only(context, "asset") and (
+            custodian is None or custodian.id != context.user.id
+        ):
             raise BizError("当前数据范围仅允许将资产分配给本人")
 
         asset_no = payload.asset_no
@@ -516,6 +533,8 @@ class AssetService:
             status=AssetStatus.PENDING_STOCK,
             custom_fields=custom_fields,
             remark=self._editable("remark", payload.remark, context),
+            created_by_id=context.user.id,
+            created_by_name=context.user.real_name or context.user.username,
         )
         self.session.add(asset)
         await self.session.flush()
@@ -591,6 +610,7 @@ class AssetService:
         if asset.version != payload.version:
             raise ConflictError("资产信息已被他人修改，请刷新后重试")
         category = await self._resolve_category(payload.category_id)
+        self._assert_category_domain(category, context)
         model = await self._resolve_model(payload.model_id, category)
         dept = await self._resolve_dept(payload.dept_id)
         custodian = await self._resolve_custodian(payload.custodian_id)
@@ -598,7 +618,7 @@ class AssetService:
             dept = custodian.dept
             payload.dept_id = custodian.dept_id
         await self._assert_dept_in_scope(dept.id if dept else None, context)
-        if is_self_only(context) and asset.custodian_id != context.user.id:
+        if is_self_only(context, "asset") and asset.custodian_id != context.user.id:
             raise BizError("无权修改数据范围外的资产")
 
         before = _asset_snapshot(asset)
@@ -746,7 +766,7 @@ class AssetService:
         dept = await self._resolve_dept(payload.dept_id)
         custodian = await self._resolve_custodian(payload.custodian_id)
         await self._assert_dept_in_scope(dept.id if dept else None, context)
-        if is_self_only(context):
+        if is_self_only(context, "asset"):
             if payload.custodian_id is not None and payload.custodian_id != context.user.id:
                 raise BizError("当前数据范围仅允许将资产分配给本人")
             if payload.clear_custodian:
@@ -1094,11 +1114,14 @@ class AssetService:
                     User.employee_no.like(pattern),
                 )
             )
-        allowed = await scoped_dept_ids(self.session, context)
-        if allowed is not None:
-            if not allowed:
-                return []
-            stmt = stmt.where(User.dept_id.in_(allowed))
+        if is_self_only(context, "asset"):
+            stmt = stmt.where(User.id == context.user.id)
+        else:
+            allowed = await scoped_dept_ids(self.session, context, resource="asset")
+            if allowed is not None:
+                if not allowed:
+                    return []
+                stmt = stmt.where(User.dept_id.in_(allowed))
         stmt = stmt.order_by(User.real_name, User.id).limit(50)
         users = list((await self.session.execute(stmt)).scalars().all())
         return [
@@ -1114,8 +1137,8 @@ class AssetService:
 
     async def dept_options(self, context: AuthContext) -> list[DeptOptionOut]:
         stmt = select(Dept).where(Dept.status == 1).order_by(Dept.path, Dept.sort, Dept.id)
-        allowed = await scoped_dept_ids(self.session, context)
-        if is_self_only(context):
+        allowed = await scoped_dept_ids(self.session, context, resource="asset")
+        if is_self_only(context, "asset"):
             allowed = {context.user.dept_id} if context.user.dept_id else set()
         if allowed is not None:
             if not allowed:

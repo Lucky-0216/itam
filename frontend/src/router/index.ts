@@ -142,6 +142,22 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '域控同步', perm: 'system:ldap:view', icon: 'Connection' },
       },
       {
+        path: 'system/dingtalk',
+        name: 'SystemDingtalk',
+        component: () => import('@/views/system/dingtalk/index.vue'),
+        meta: { title: '钉钉同步', perm: 'system:dingtalk:view', icon: 'ChatDotRound' },
+      },
+      {
+        path: 'system/org-sync-policy',
+        name: 'SystemOrgSyncPolicy',
+        component: () => import('@/views/system/org-sync-policy/index.vue'),
+        meta: {
+          title: '组织同步策略',
+          perm: 'system:org-sync-policy:view',
+          icon: 'SetUp',
+        },
+      },
+      {
         path: 'system/approval-flows',
         name: 'SystemApprovalFlows',
         component: () => import('@/views/system/approval-flows/index.vue'),

@@ -7,24 +7,29 @@ from app.core.response import ok
 from app.schemas.org import (
     DeptCreate,
     DeptUpdate,
+    OrgSyncPolicyUpdate,
     ResetPasswordRequest,
     UserCreate,
     UserStatusUpdate,
     UserUpdate,
 )
 from app.services.dept_service import DeptService
+from app.services.org_policy_service import OrgSyncPolicyService
 from app.services.permission_service import AuthContext
 from app.services.user_admin_service import UserAdminService
 
 router = APIRouter(tags=["组织与人员"])
 
+_SOURCE_PATTERN = "^(local|ldap|dingtalk)$"
+
 
 @router.get("/departments/tree", summary="部门树")
 async def department_tree(
+    source: str | None = Query(None, pattern=_SOURCE_PATTERN),
     context: AuthContext = Depends(require_perm("system:org:view")),
     session: AsyncSession = Depends(get_db),
 ):
-    result = await DeptService(session).tree(context)
+    result = await DeptService(session).tree(context, source=source)
     return ok([item.model_dump(mode="json") for item in result])
 
 
@@ -68,6 +73,7 @@ async def list_users(
     include_child: bool = True,
     status: int | None = Query(None, ge=0, le=1),
     role_id: int | None = Query(None, ge=1),
+    source: str | None = Query(None, pattern=_SOURCE_PATTERN),
     context: AuthContext = Depends(require_perm("system:org:view")),
     session: AsyncSession = Depends(get_db),
 ):
@@ -80,6 +86,7 @@ async def list_users(
         include_child=include_child,
         status=status,
         role_id=role_id,
+        source=source,
     )
     return ok(result.model_dump(mode="json"))
 
@@ -145,3 +152,22 @@ async def delete_user(
 ):
     await UserAdminService(session).delete_user(user_id, context)
     return ok(None, message="用户已删除（历史记录保留）")
+
+
+@router.get("/sync-policy", summary="组织同步策略")
+async def get_sync_policy(
+    context: AuthContext = Depends(require_perm("system:org-sync-policy:view")),
+    session: AsyncSession = Depends(get_db),
+):
+    result = await OrgSyncPolicyService(session).get_policy_out()
+    return ok(result.model_dump(mode="json"))
+
+
+@router.put("/sync-policy", summary="更新组织同步策略")
+async def update_sync_policy(
+    payload: OrgSyncPolicyUpdate,
+    context: AuthContext = Depends(require_perm("system:org-sync-policy:update")),
+    session: AsyncSession = Depends(get_db),
+):
+    result = await OrgSyncPolicyService(session).save_policy(payload, context.user)
+    return ok(result.model_dump(mode="json"), message="组织同步策略已更新")

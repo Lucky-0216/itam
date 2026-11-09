@@ -93,6 +93,7 @@ class LdapSyncLog(Base, IdMixin, TimestampMixin):
     dept_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     dept_created: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     dept_updated: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    dept_skipped: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     user_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     user_created: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     user_updated: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

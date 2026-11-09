@@ -505,8 +505,6 @@ input {
 
 .page {
   width: 100%;
-  max-width: 1560px;
-  margin: 0 auto;
 }
 
 .page-header {
@@ -617,6 +615,7 @@ input {
 }
 
 .el-dialog {
+  max-width: calc(100vw - 32px);
   border-radius: 18px;
   overflow: hidden;
   box-shadow: 0 40px 100px -30px rgba(2, 8, 20, 0.5);

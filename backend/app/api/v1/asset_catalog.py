@@ -1,10 +1,12 @@
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import require_perm
+from app.api.deps import require_any_perm, require_perm
 from app.core.database import get_db
 from app.core.response import ok
 from app.schemas.asset import (
+    AssetDomainCreate,
+    AssetDomainUpdate,
     CategoryCreate,
     CategoryFieldCreate,
     CategoryFieldUpdate,
@@ -12,10 +14,56 @@ from app.schemas.asset import (
     ModelCreate,
     ModelUpdate,
 )
-from app.services.asset_catalog_service import CategoryService, ModelService
+from app.services.asset_catalog_service import (
+    AssetDomainService,
+    CategoryService,
+    ModelService,
+)
 from app.services.permission_service import AuthContext
 
 router = APIRouter(tags=["资产分类与型号"])
+
+
+@router.get("/asset-domains", summary="资产域列表")
+async def list_asset_domains(
+    context: AuthContext = Depends(
+        require_any_perm("asset:category:view", "system:role:view")
+    ),
+    session: AsyncSession = Depends(get_db),
+):
+    result = await AssetDomainService(session).list(context)
+    return ok([item.model_dump(mode="json") for item in result])
+
+
+@router.post("/asset-domains", summary="新增资产域")
+async def create_asset_domain(
+    payload: AssetDomainCreate,
+    context: AuthContext = Depends(require_perm("asset:category:update")),
+    session: AsyncSession = Depends(get_db),
+):
+    result = await AssetDomainService(session).create(payload, context)
+    return ok(result.model_dump(mode="json"), message="资产域创建成功")
+
+
+@router.put("/asset-domains/{domain_id}", summary="编辑资产域")
+async def update_asset_domain(
+    domain_id: int,
+    payload: AssetDomainUpdate,
+    context: AuthContext = Depends(require_perm("asset:category:update")),
+    session: AsyncSession = Depends(get_db),
+):
+    result = await AssetDomainService(session).update(domain_id, payload, context)
+    return ok(result.model_dump(mode="json"), message="资产域已更新")
+
+
+@router.delete("/asset-domains/{domain_id}", summary="删除资产域")
+async def delete_asset_domain(
+    domain_id: int,
+    context: AuthContext = Depends(require_perm("asset:category:update")),
+    session: AsyncSession = Depends(get_db),
+):
+    await AssetDomainService(session).delete(domain_id, context)
+    return ok(None, message="资产域已删除")
 
 
 @router.get("/asset-categories/tree", summary="资产分类树")

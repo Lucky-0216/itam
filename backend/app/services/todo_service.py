@@ -67,7 +67,9 @@ from app.core.todos import (
 from app.models import (
     ApprovalTask,
     Asset,
+    AssetCategory,
     AssetInbound,
+    AssetInboundItem,
     AssetMaintenance,
     AssetRequest,
     AssetScrap,
@@ -83,8 +85,13 @@ from app.schemas.todo import (
     TodoSummaryOut,
     TodoTypeCountOut,
 )
+from app.services import dingtalk_approval
 from app.services.permission_service import AuthContext
-from app.services.scope_service import scoped_dept_ids
+from app.services.scope_service import (
+    asset_domain_condition,
+    is_self_only,
+    scoped_dept_ids,
+)
 
 REQUEST_KINDS = ("REQUISITION", "BORROW", "RETURN")
 
@@ -100,6 +107,58 @@ class TodoService:
         if allowed is None:
             return true()
         return column.in_(allowed) if allowed else false()
+
+    def _record_scope(
+        self,
+        context: AuthContext,
+        resource: str,
+        column,
+        allowed: set[int] | None,
+        domain,
+        self_column,
+    ):
+        scope = (
+            self_column == context.user.id
+            if is_self_only(context, resource)
+            else self._scope_condition(column, allowed)
+        )
+        return and_(scope, domain)
+
+    @staticmethod
+    def _request_domain_condition(context: AuthContext):
+        domains = context.allowed_domains("requisition")
+        if domains is None:
+            return true()
+        return AssetRequest.category_id.in_(
+            select(AssetCategory.id).where(AssetCategory.asset_domain.in_(domains))
+        )
+
+    @staticmethod
+    def _asset_domain_condition(column, context: AuthContext, resource: str):
+        condition = asset_domain_condition(context, resource)
+        if condition is None:
+            return true()
+        return column.in_(select(Asset.id).where(condition))
+
+    @staticmethod
+    def _inventory_domain_condition(context: AuthContext):
+        domains = context.allowed_domains("inventory")
+        if domains is None:
+            return true()
+        return InventoryTask.scope_category_id.in_(
+            select(AssetCategory.id).where(AssetCategory.asset_domain.in_(domains))
+        )
+
+    @staticmethod
+    def _inbound_domain_condition(context: AuthContext):
+        domains = context.allowed_domains("inbound")
+        if domains is None:
+            return true()
+        return AssetInbound.id.in_(
+            select(AssetInboundItem.inbound_id)
+            .join(AssetCategory, AssetCategory.id == AssetInboundItem.category_id)
+            .where(AssetCategory.asset_domain.in_(domains))
+        )
 
     @staticmethod
     def _pending_task_exists(context: AuthContext):
@@ -153,20 +212,30 @@ class TodoService:
                 or_(*legacy_parts),
                 self._scope_condition(AssetRequest.applicant_dept_id, allowed),
             )
-            if legacy_parts
+            if legacy_parts and not is_self_only(context, "requisition")
             else false()
         )
         return and_(
             AssetRequest.status == RequestStatus.PENDING_APPROVAL,
+            ~dingtalk_approval.running_link_exists(request_id=AssetRequest.id),
             or_(flow_condition, legacy_condition),
+            self._request_domain_condition(context),
         )
+
+    def _request_operation_scope(self, context: AuthContext, allowed):
+        scope = (
+            AssetRequest.applicant_id == context.user.id
+            if is_self_only(context, "requisition")
+            else self._scope_condition(AssetRequest.applicant_dept_id, allowed)
+        )
+        return and_(scope, self._request_domain_condition(context))
 
     def _request_outbound_condition(self, context: AuthContext, allowed):
         if not context.has_permission("asset:request:outbound"):
             return false()
         return and_(
             AssetRequest.status == RequestStatus.PENDING_OUTBOUND,
-            self._scope_condition(AssetRequest.applicant_dept_id, allowed),
+            self._request_operation_scope(context, allowed),
         )
 
     def _request_return_condition(self, context: AuthContext, allowed):
@@ -174,7 +243,7 @@ class TodoService:
             return false()
         return and_(
             AssetRequest.status == RequestStatus.PENDING_RETURN,
-            self._scope_condition(AssetRequest.applicant_dept_id, allowed),
+            self._request_operation_scope(context, allowed),
         )
 
     # ---------- UNION 列定义 ----------
@@ -348,8 +417,14 @@ class TodoService:
     # ---------- 待办分支 ----------
 
     async def _build_branches(
-        self, context: AuthContext, allowed: set[int] | None
+        self, context: AuthContext, scopes: dict[str, set[int] | None]
     ) -> list[Select]:
+        request_scope = scopes.get("requisition")
+        transfer_scope = scopes.get("transfer")
+        scrap_scope = scopes.get("scrap")
+        maintenance_scope = scopes.get("maintenance")
+        inventory_scope = scopes.get("inventory")
+        inbound_scope = scopes.get("inbound")
         user_id = context.user.id
         today = now_cst().date()
         due_limit = today + timedelta(days=settings.BORROW_REMINDER_DAYS)
@@ -359,7 +434,7 @@ class TodoService:
             branches.append(
                 self._request_select(
                     TodoType.REQUEST_APPROVAL,
-                    self._request_approval_condition(context, allowed),
+                    self._request_approval_condition(context, request_scope),
                 )
             )
         if context.has_permission("asset:transfer:approve"):
@@ -368,7 +443,19 @@ class TodoService:
                     TodoType.TRANSFER_APPROVAL,
                     and_(
                         AssetTransfer.status == TransferStatus.PENDING_APPROVAL,
-                        self._scope_condition(AssetTransfer.from_dept_id, allowed),
+                        ~dingtalk_approval.running_link_exists(
+                            transfer_id=AssetTransfer.id
+                        ),
+                        self._record_scope(
+                            context,
+                            "transfer",
+                            AssetTransfer.from_dept_id,
+                            transfer_scope,
+                            self._asset_domain_condition(
+                                AssetTransfer.asset_id, context, "transfer"
+                            ),
+                            AssetTransfer.applicant_id,
+                        ),
                     ),
                 )
             )
@@ -378,7 +465,16 @@ class TodoService:
                     TodoType.SCRAP_APPROVAL,
                     and_(
                         AssetScrap.status == ScrapStatus.PENDING_APPROVAL,
-                        self._scope_condition(AssetScrap.from_dept_id, allowed),
+                        self._record_scope(
+                            context,
+                            "scrap",
+                            AssetScrap.from_dept_id,
+                            scrap_scope,
+                            self._asset_domain_condition(
+                                AssetScrap.asset_id, context, "scrap"
+                            ),
+                            AssetScrap.applicant_id,
+                        ),
                     ),
                 )
             )
@@ -389,7 +485,16 @@ class TodoService:
                     and_(
                         AssetMaintenance.status
                         == MaintenanceStatus.PENDING_APPROVAL,
-                        self._scope_condition(AssetMaintenance.from_dept_id, allowed),
+                        self._record_scope(
+                            context,
+                            "maintenance",
+                            AssetMaintenance.from_dept_id,
+                            maintenance_scope,
+                            self._asset_domain_condition(
+                                AssetMaintenance.asset_id, context, "maintenance"
+                            ),
+                            AssetMaintenance.applicant_id,
+                        ),
                     ),
                 )
             )
@@ -401,7 +506,14 @@ class TodoService:
                     and_(
                         InventoryAdjustment.status
                         == InventoryAdjustmentStatus.PENDING,
-                        self._scope_condition(InventoryTask.scope_dept_id, allowed),
+                        self._record_scope(
+                            context,
+                            "inventory",
+                            InventoryTask.scope_dept_id,
+                            inventory_scope,
+                            self._inventory_domain_condition(context),
+                            InventoryAdjustment.requested_by_id,
+                        ),
                     ),
                 )
             )
@@ -410,14 +522,14 @@ class TodoService:
             branches.append(
                 self._request_select(
                     TodoType.REQUEST_OUTBOUND,
-                    self._request_outbound_condition(context, allowed),
+                    self._request_outbound_condition(context, request_scope),
                 )
             )
         if context.has_permission("asset:return:confirm"):
             branches.append(
                 self._request_select(
                     TodoType.REQUEST_RETURN,
-                    self._request_return_condition(context, allowed),
+                    self._request_return_condition(context, request_scope),
                 )
             )
         if context.has_permission("asset:transfer:confirm"):
@@ -426,7 +538,16 @@ class TodoService:
                     TodoType.TRANSFER_CONFIRM,
                     and_(
                         AssetTransfer.status == TransferStatus.PENDING_TRANSFER,
-                        self._scope_condition(AssetTransfer.from_dept_id, allowed),
+                        self._record_scope(
+                            context,
+                            "transfer",
+                            AssetTransfer.from_dept_id,
+                            transfer_scope,
+                            self._asset_domain_condition(
+                                AssetTransfer.asset_id, context, "transfer"
+                            ),
+                            AssetTransfer.applicant_id,
+                        ),
                     ),
                 )
             )
@@ -436,7 +557,16 @@ class TodoService:
                     TodoType.SCRAP_CONFIRM,
                     and_(
                         AssetScrap.status == ScrapStatus.PENDING_DISPOSAL,
-                        self._scope_condition(AssetScrap.from_dept_id, allowed),
+                        self._record_scope(
+                            context,
+                            "scrap",
+                            AssetScrap.from_dept_id,
+                            scrap_scope,
+                            self._asset_domain_condition(
+                                AssetScrap.asset_id, context, "scrap"
+                            ),
+                            AssetScrap.applicant_id,
+                        ),
                     ),
                 )
             )
@@ -446,20 +576,39 @@ class TodoService:
                     TodoType.INBOUND_CONFIRM,
                     and_(
                         AssetInbound.status == InboundStatus.PENDING,
-                        self._scope_condition(AssetInbound.dept_id, allowed),
+                        self._record_scope(
+                            context,
+                            "inbound",
+                            AssetInbound.dept_id,
+                            inbound_scope,
+                            self._inbound_domain_condition(context),
+                            AssetInbound.created_by_id,
+                        ),
                     ),
                 )
             )
 
         if context.has_permission("asset:maintenance:repair"):
-            repair_scope = self._scope_condition(
-                AssetMaintenance.from_dept_id, allowed
+            repair_scope = self._record_scope(
+                context,
+                "maintenance",
+                AssetMaintenance.from_dept_id,
+                maintenance_scope,
+                self._asset_domain_condition(
+                    AssetMaintenance.asset_id, context, "maintenance"
+                ),
+                AssetMaintenance.applicant_id,
             )
-            operate_condition = or_(
-                AssetMaintenance.repairer_id == user_id,
-                and_(
-                    context.has_permission("asset:maintenance:accept"),
-                    repair_scope,
+            operate_condition = and_(
+                self._asset_domain_condition(
+                    AssetMaintenance.asset_id, context, "maintenance"
+                ),
+                or_(
+                    AssetMaintenance.repairer_id == user_id,
+                    and_(
+                        context.has_permission("asset:maintenance:accept"),
+                        repair_scope,
+                    ),
                 ),
             )
             branches.append(
@@ -483,7 +632,16 @@ class TodoService:
                     and_(
                         AssetMaintenance.status
                         == MaintenanceStatus.PENDING_ACCEPTANCE,
-                        self._scope_condition(AssetMaintenance.from_dept_id, allowed),
+                        self._record_scope(
+                            context,
+                            "maintenance",
+                            AssetMaintenance.from_dept_id,
+                            maintenance_scope,
+                            self._asset_domain_condition(
+                                AssetMaintenance.asset_id, context, "maintenance"
+                            ),
+                            AssetMaintenance.applicant_id,
+                        ),
                     ),
                 )
             )
@@ -493,16 +651,23 @@ class TodoService:
                     TodoType.INVENTORY,
                     and_(
                         InventoryTask.status == InventoryStatus.IN_PROGRESS,
-                        self._scope_condition(InventoryTask.scope_dept_id, allowed),
+                        self._record_scope(
+                            context,
+                            "inventory",
+                            InventoryTask.scope_dept_id,
+                            inventory_scope,
+                            self._inventory_domain_condition(context),
+                            InventoryTask.created_by_id,
+                        ),
                     ),
                 )
             )
 
         # 我发起且仍在处理中的单据，排除已轮到我处理的事项，避免重复提醒
         request_actionable = or_(
-            self._request_approval_condition(context, allowed),
-            self._request_outbound_condition(context, allowed),
-            self._request_return_condition(context, allowed),
+            self._request_approval_condition(context, request_scope),
+            self._request_outbound_condition(context, request_scope),
+            self._request_return_condition(context, request_scope),
         )
         borrow_due_soon = and_(
             AssetRequest.status == RequestStatus.BORROWED,
@@ -515,6 +680,7 @@ class TodoService:
                 and_(
                     AssetRequest.applicant_id == user_id,
                     AssetRequest.status.in_(ACTIVE_REQUEST_STATUSES),
+                    self._request_domain_condition(context),
                     ~or_(request_actionable, borrow_due_soon),
                 ),
             )
@@ -525,14 +691,35 @@ class TodoService:
             transfer_actionable_parts.append(
                 and_(
                     AssetTransfer.status == TransferStatus.PENDING_APPROVAL,
-                    self._scope_condition(AssetTransfer.from_dept_id, allowed),
+                    ~dingtalk_approval.running_link_exists(
+                        transfer_id=AssetTransfer.id
+                    ),
+                    self._record_scope(
+                        context,
+                        "transfer",
+                        AssetTransfer.from_dept_id,
+                        transfer_scope,
+                        self._asset_domain_condition(
+                            AssetTransfer.asset_id, context, "transfer"
+                        ),
+                        AssetTransfer.applicant_id,
+                    ),
                 )
             )
         if context.has_permission("asset:transfer:confirm"):
             transfer_actionable_parts.append(
                 and_(
                     AssetTransfer.status == TransferStatus.PENDING_TRANSFER,
-                    self._scope_condition(AssetTransfer.from_dept_id, allowed),
+                    self._record_scope(
+                        context,
+                        "transfer",
+                        AssetTransfer.from_dept_id,
+                        transfer_scope,
+                        self._asset_domain_condition(
+                            AssetTransfer.asset_id, context, "transfer"
+                        ),
+                        AssetTransfer.applicant_id,
+                    ),
                 )
             )
         branches.append(
@@ -541,6 +728,9 @@ class TodoService:
                 and_(
                     AssetTransfer.applicant_id == user_id,
                     AssetTransfer.status.in_(TRANSFER_ACTIVE_STATUSES),
+                    self._asset_domain_condition(
+                        AssetTransfer.asset_id, context, "transfer"
+                    ),
                     ~(
                         or_(*transfer_actionable_parts)
                         if transfer_actionable_parts
@@ -555,14 +745,32 @@ class TodoService:
             scrap_actionable_parts.append(
                 and_(
                     AssetScrap.status == ScrapStatus.PENDING_APPROVAL,
-                    self._scope_condition(AssetScrap.from_dept_id, allowed),
+                    self._record_scope(
+                        context,
+                        "scrap",
+                        AssetScrap.from_dept_id,
+                        scrap_scope,
+                        self._asset_domain_condition(
+                            AssetScrap.asset_id, context, "scrap"
+                        ),
+                        AssetScrap.applicant_id,
+                    ),
                 )
             )
         if context.has_permission("asset:scrap:confirm"):
             scrap_actionable_parts.append(
                 and_(
                     AssetScrap.status == ScrapStatus.PENDING_DISPOSAL,
-                    self._scope_condition(AssetScrap.from_dept_id, allowed),
+                    self._record_scope(
+                        context,
+                        "scrap",
+                        AssetScrap.from_dept_id,
+                        scrap_scope,
+                        self._asset_domain_condition(
+                            AssetScrap.asset_id, context, "scrap"
+                        ),
+                        AssetScrap.applicant_id,
+                    ),
                 )
             )
         branches.append(
@@ -571,6 +779,9 @@ class TodoService:
                 and_(
                     AssetScrap.applicant_id == user_id,
                     AssetScrap.status.in_(SCRAP_ACTIVE_STATUSES),
+                    self._asset_domain_condition(
+                        AssetScrap.asset_id, context, "scrap"
+                    ),
                     ~(
                         or_(*scrap_actionable_parts)
                         if scrap_actionable_parts
@@ -585,7 +796,16 @@ class TodoService:
             maintenance_actionable_parts.append(
                 and_(
                     AssetMaintenance.status == MaintenanceStatus.PENDING_APPROVAL,
-                    self._scope_condition(AssetMaintenance.from_dept_id, allowed),
+                    self._record_scope(
+                        context,
+                        "maintenance",
+                        AssetMaintenance.from_dept_id,
+                        maintenance_scope,
+                        self._asset_domain_condition(
+                            AssetMaintenance.asset_id, context, "maintenance"
+                        ),
+                        AssetMaintenance.applicant_id,
+                    ),
                 )
             )
         if context.has_permission("asset:maintenance:repair"):
@@ -597,12 +817,26 @@ class TodoService:
                             MaintenanceStatus.REPAIRING,
                         )
                     ),
-                    or_(
-                        AssetMaintenance.repairer_id == user_id,
-                        and_(
-                            context.has_permission("asset:maintenance:accept"),
-                            self._scope_condition(
-                                AssetMaintenance.from_dept_id, allowed
+                    and_(
+                        self._asset_domain_condition(
+                            AssetMaintenance.asset_id, context, "maintenance"
+                        ),
+                        or_(
+                            AssetMaintenance.repairer_id == user_id,
+                            and_(
+                                context.has_permission("asset:maintenance:accept"),
+                                self._record_scope(
+                                    context,
+                                    "maintenance",
+                                    AssetMaintenance.from_dept_id,
+                                    maintenance_scope,
+                                    self._asset_domain_condition(
+                                        AssetMaintenance.asset_id,
+                                        context,
+                                        "maintenance",
+                                    ),
+                                    AssetMaintenance.applicant_id,
+                                ),
                             ),
                         ),
                     ),
@@ -613,7 +847,16 @@ class TodoService:
                 and_(
                     AssetMaintenance.status
                     == MaintenanceStatus.PENDING_ACCEPTANCE,
-                    self._scope_condition(AssetMaintenance.from_dept_id, allowed),
+                    self._record_scope(
+                        context,
+                        "maintenance",
+                        AssetMaintenance.from_dept_id,
+                        maintenance_scope,
+                        self._asset_domain_condition(
+                            AssetMaintenance.asset_id, context, "maintenance"
+                        ),
+                        AssetMaintenance.applicant_id,
+                    ),
                 )
             )
         branches.append(
@@ -622,6 +865,9 @@ class TodoService:
                 and_(
                     AssetMaintenance.applicant_id == user_id,
                     AssetMaintenance.status.in_(MAINTENANCE_ACTIVE_STATUSES),
+                    self._asset_domain_condition(
+                        AssetMaintenance.asset_id, context, "maintenance"
+                    ),
                     ~(
                         or_(*maintenance_actionable_parts)
                         if maintenance_actionable_parts
@@ -634,7 +880,14 @@ class TodoService:
         inventory_actionable = (
             and_(
                 InventoryTask.status == InventoryStatus.IN_PROGRESS,
-                self._scope_condition(InventoryTask.scope_dept_id, allowed),
+                self._record_scope(
+                    context,
+                    "inventory",
+                    InventoryTask.scope_dept_id,
+                    inventory_scope,
+                    self._inventory_domain_condition(context),
+                    InventoryTask.created_by_id,
+                ),
             )
             if context.has_permission("asset:inventory:manage")
             else false()
@@ -645,6 +898,7 @@ class TodoService:
                 and_(
                     InventoryTask.created_by_id == user_id,
                     InventoryTask.status == InventoryStatus.IN_PROGRESS,
+                    self._inventory_domain_condition(context),
                     ~inventory_actionable,
                 ),
             )
@@ -653,7 +907,14 @@ class TodoService:
         adjustment_actionable = (
             and_(
                 InventoryAdjustment.status == InventoryAdjustmentStatus.PENDING,
-                self._scope_condition(InventoryTask.scope_dept_id, allowed),
+                self._record_scope(
+                    context,
+                    "inventory",
+                    InventoryTask.scope_dept_id,
+                    inventory_scope,
+                    self._inventory_domain_condition(context),
+                    InventoryAdjustment.requested_by_id,
+                ),
             )
             if context.has_permission("asset:inventory:approve")
             else false()
@@ -664,6 +925,7 @@ class TodoService:
                 and_(
                     InventoryAdjustment.requested_by_id == user_id,
                     InventoryAdjustment.status == InventoryAdjustmentStatus.PENDING,
+                    self._inventory_domain_condition(context),
                     ~adjustment_actionable,
                 ),
             )
@@ -672,7 +934,14 @@ class TodoService:
         inbound_actionable = (
             and_(
                 AssetInbound.status == InboundStatus.PENDING,
-                self._scope_condition(AssetInbound.dept_id, allowed),
+                self._record_scope(
+                    context,
+                    "inbound",
+                    AssetInbound.dept_id,
+                    inbound_scope,
+                    self._inbound_domain_condition(context),
+                    AssetInbound.created_by_id,
+                ),
             )
             if context.has_permission("asset:inbound:confirm")
             else false()
@@ -683,6 +952,7 @@ class TodoService:
                 and_(
                     AssetInbound.created_by_id == user_id,
                     AssetInbound.status == InboundStatus.PENDING,
+                    self._inbound_domain_condition(context),
                     ~inbound_actionable,
                 ),
             )
@@ -703,6 +973,7 @@ class TodoService:
                 AssetRequest.applicant_id == user_id,
                 Asset.custodian_id == user_id,
             ),
+            self._request_domain_condition(context),
             ~pending_return_exists,
         )
         branches.append(
@@ -732,8 +1003,19 @@ class TodoService:
     # ---------- 查询 ----------
 
     async def _union(self, context: AuthContext):
-        allowed = await scoped_dept_ids(self.session, context)
-        branches = await self._build_branches(context, allowed)
+        scopes: dict[str, set[int] | None] = {}
+        for resource in (
+            "requisition",
+            "transfer",
+            "scrap",
+            "maintenance",
+            "inventory",
+            "inbound",
+        ):
+            scopes[resource] = await scoped_dept_ids(
+                self.session, context, resource=resource
+            )
+        branches = await self._build_branches(context, scopes)
         return union_all(*branches).subquery("todo_union")
 
     async def _type_counts(self, union) -> dict[str, int]:

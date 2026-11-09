@@ -19,8 +19,9 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.core.assets import AssetStatus, CategoryType
+from app.core.assets import AssetDomain, AssetStatus, CategoryType
 from app.models.base import Base, IdMixin, TimestampMixin, VersionMixin, now_cst
+from app.models.dingtalk import DingTalkApproval
 from app.models.rbac import Dept, User
 
 
@@ -43,6 +44,12 @@ class AssetCategory(Base, IdMixin, TimestampMixin, VersionMixin):
         String(20),
         nullable=False,
         default=CategoryType.HARDWARE,
+    )
+    asset_domain: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default=AssetDomain.IT,
+        index=True,
     )
     path: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     level: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
@@ -217,6 +224,14 @@ class AssetRequest(Base, IdMixin, TimestampMixin, VersionMixin):
     applicant_dept: Mapped[Dept | None] = relationship(
         "Dept", foreign_keys=[applicant_dept_id], lazy="selectin"
     )
+    dingtalk_approval: Mapped[DingTalkApproval | None] = relationship(
+        primaryjoin=(
+            "and_(foreign(DingTalkApproval.request_id) == AssetRequest.id)"
+        ),
+        uselist=False,
+        lazy="selectin",
+        viewonly=True,
+    )
 
 
 class AssetRequestApproval(Base, IdMixin, TimestampMixin):
@@ -313,6 +328,7 @@ class Asset(Base, IdMixin, TimestampMixin, VersionMixin):
         Index("ix_ast_assets_status", "status"),
         Index("ix_ast_assets_warranty_end", "warranty_end"),
         Index("ix_ast_assets_deleted_at", "deleted_at"),
+        Index("ix_ast_assets_created_by_id", "created_by_id"),
     )
 
     asset_no: Mapped[str] = mapped_column(String(50), nullable=False)
@@ -357,6 +373,11 @@ class Asset(Base, IdMixin, TimestampMixin, VersionMixin):
     )
     voided_by_name: Mapped[str | None] = mapped_column(String(50))
     void_reason: Mapped[str | None] = mapped_column(String(500))
+    created_by_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("sys_users.id", ondelete="SET NULL"),
+    )
+    created_by_name: Mapped[str | None] = mapped_column(String(50))
 
     category: Mapped[AssetCategory] = relationship("AssetCategory", lazy="selectin")
     model: Mapped[AssetModel | None] = relationship("AssetModel", lazy="selectin")

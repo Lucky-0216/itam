@@ -24,7 +24,7 @@ async def available_categories(
     context: AuthContext = Depends(require_perm("asset:requisition:create")),
     session: AsyncSession = Depends(get_db),
 ):
-    items = await AssetFlowService(session).available_categories()
+    items = await AssetFlowService(session).available_categories(context)
     return ok([item.model_dump(mode="json") for item in items])
 
 
@@ -34,7 +34,7 @@ async def category_options(
     context: AuthContext = Depends(require_perm("asset:requisition:create")),
     session: AsyncSession = Depends(get_db),
 ):
-    items = await AssetFlowService(session).category_options(parent_id)
+    items = await AssetFlowService(session).category_options(context, parent_id)
     return ok([item.model_dump(mode="json") for item in items])
 
 
@@ -59,6 +59,7 @@ async def available_models(
     session: AsyncSession = Depends(get_db),
 ):
     items = await AssetFlowService(session).available_models(
+        context,
         category_id=category_id,
         include_child=include_child,
     )
@@ -80,6 +81,7 @@ async def available_assets(
     session: AsyncSession = Depends(get_db),
 ):
     items, total = await AssetFlowService(session).available_assets(
+        context,
         category_id=category_id,
         include_child=include_child,
         model_ids=_parse_model_ids(model_ids),
@@ -128,7 +130,12 @@ async def review_requests(
     status: str | None = Query(None, max_length=24),
     pending_mine: bool = Query(True, description="仅显示当前用户可处理的事项"),
     context: AuthContext = Depends(
-        require_any_perm("asset:request:review", "asset:request:approve")
+        require_any_perm(
+            "asset:request:review",
+            "asset:request:approve",
+            "asset:outbound:view",
+            "asset:return:confirm:view",
+        )
     ),
     session: AsyncSession = Depends(get_db),
 ):
@@ -148,7 +155,13 @@ async def review_requests(
 @router.get("/asset-requests/review-summary", summary="业务待办统计")
 async def review_summary(
     context: AuthContext = Depends(
-        require_any_perm("asset:request:review", "asset:requisition:view")
+        require_any_perm(
+            "asset:request:review",
+            "asset:requisition:view",
+            "asset:request:approve",
+            "asset:outbound:view",
+            "asset:return:confirm:view",
+        )
     ),
     session: AsyncSession = Depends(get_db),
 ):
@@ -160,7 +173,13 @@ async def review_summary(
 async def scan_asset(
     code: str = Query(..., min_length=1, max_length=120),
     context: AuthContext = Depends(
-        require_any_perm("asset:requisition:view", "asset:request:review")
+        require_any_perm(
+            "asset:requisition:view",
+            "asset:request:review",
+            "asset:request:approve",
+            "asset:outbound:view",
+            "asset:return:confirm:view",
+        )
     ),
     session: AsyncSession = Depends(get_db),
 ):
@@ -225,7 +244,12 @@ async def request_detail(
     request_id: int,
     context: AuthContext = Depends(
         require_any_perm(
-            "asset:requisition:view", "asset:mine:view", "asset:request:review"
+            "asset:requisition:view",
+            "asset:mine:view",
+            "asset:request:review",
+            "asset:request:approve",
+            "asset:outbound:view",
+            "asset:return:confirm:view",
         )
     ),
     session: AsyncSession = Depends(get_db),
@@ -242,7 +266,9 @@ async def outbound_assets(
     request_id: int,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
-    context: AuthContext = Depends(require_perm("asset:request:outbound")),
+    context: AuthContext = Depends(
+        require_any_perm("asset:request:outbound", "asset:outbound:view")
+    ),
     session: AsyncSession = Depends(get_db),
 ):
     items, total = await AssetFlowService(session).outbound_assets(

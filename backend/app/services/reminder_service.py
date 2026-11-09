@@ -35,6 +35,8 @@ from app.services.email_service import EmailNotifier
 from app.services.permission_service import AuthContext
 from app.services.scope_service import (
     asset_scope_conditions,
+    category_domain_condition,
+    contract_domain_condition,
     is_self_only,
     scoped_dept_ids,
 )
@@ -198,7 +200,9 @@ class ReminderService:
     async def _warranty_items(
         self, context: AuthContext, today: date
     ) -> list[ReminderItem]:
-        conditions = await asset_scope_conditions(self.session, context)
+        conditions = await asset_scope_conditions(
+            self.session, context, resource="asset"
+        )
         limit_date = today + timedelta(days=settings.WARRANTY_REMINDER_DAYS)
         assets = list(
             (
@@ -257,18 +261,22 @@ class ReminderService:
     async def _contract_items(
         self, context: AuthContext, today: date
     ) -> list[ReminderItem]:
-        allowed = await scoped_dept_ids(self.session, context)
+        allowed = await scoped_dept_ids(self.session, context, resource="contract")
         conditions: list = [AssetContract.status == ContractStatus.ACTIVE]
-        if allowed is not None:
-            if allowed:
-                conditions.append(
-                    or_(
-                        AssetContract.dept_id.is_(None),
-                        AssetContract.dept_id.in_(allowed),
-                    )
+        if is_self_only(context, "contract"):
+            conditions.append(
+                or_(
+                    AssetContract.owner_id == context.user.id,
+                    AssetContract.created_by_id == context.user.id,
                 )
-            else:
-                conditions.append(AssetContract.dept_id.is_(None))
+            )
+        elif allowed is not None:
+            conditions.append(
+                AssetContract.dept_id.in_(allowed) if allowed else false()
+            )
+        domain_condition = contract_domain_condition(context)
+        if domain_condition is not None:
+            conditions.append(domain_condition)
         limit_date = today + timedelta(days=settings.CONTRACT_REMINDER_DAYS)
         contracts = list(
             (
@@ -328,9 +336,11 @@ class ReminderService:
             AssetRequest.expected_return_date <= limit_date,
         ]
         if context.has_permission("asset:request:review") and not is_self_only(
-            context
+            context, "requisition"
         ):
-            allowed = await scoped_dept_ids(self.session, context)
+            allowed = await scoped_dept_ids(
+                self.session, context, resource="requisition"
+            )
             if allowed is None:
                 pass
             elif allowed:
@@ -344,6 +354,11 @@ class ReminderService:
                 conditions.append(AssetRequest.applicant_id == context.user.id)
         else:
             conditions.append(AssetRequest.applicant_id == context.user.id)
+        domain_condition = category_domain_condition(
+            AssetRequest.category_id, context, "requisition"
+        )
+        if domain_condition is not None:
+            conditions.append(domain_condition)
         requests = list(
             (
                 await self.session.execute(
@@ -398,18 +413,24 @@ class ReminderService:
     async def _inventory_items(
         self, context: AuthContext, today: date
     ) -> list[ReminderItem]:
-        allowed = await scoped_dept_ids(self.session, context)
+        allowed = await scoped_dept_ids(self.session, context, resource="inventory")
         conditions: list = [
             InventoryTask.status == InventoryStatus.IN_PROGRESS,
             InventoryTask.planned_date.is_not(None),
             InventoryTask.planned_date
             <= today + timedelta(days=settings.INVENTORY_REMINDER_DAYS),
         ]
-        if allowed is not None:
-            if allowed:
-                conditions.append(InventoryTask.scope_dept_id.in_(allowed))
-            else:
-                conditions.append(false())
+        if is_self_only(context, "inventory"):
+            conditions.append(InventoryTask.created_by_id == context.user.id)
+        elif allowed is not None:
+            conditions.append(
+                InventoryTask.scope_dept_id.in_(allowed) if allowed else false()
+            )
+        domain_condition = category_domain_condition(
+            InventoryTask.scope_category_id, context, "inventory"
+        )
+        if domain_condition is not None:
+            conditions.append(domain_condition)
         tasks = list(
             (
                 await self.session.execute(

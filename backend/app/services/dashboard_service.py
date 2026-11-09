@@ -1,6 +1,6 @@
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import false, func, select
+from sqlalchemy import false, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.asset_flow import RequestStatus, RequestType
@@ -11,7 +11,9 @@ from app.models import (
     Asset,
     AssetCategory,
     AssetContract,
+    AssetContractAsset,
     AssetInbound,
+    AssetInboundItem,
     AssetRequest,
     Dept,
 )
@@ -29,7 +31,11 @@ from app.schemas.dashboard import (
     WarrantyItem,
 )
 from app.services.permission_service import AuthContext
-from app.services.scope_service import asset_scope_conditions, scoped_dept_ids
+from app.services.scope_service import (
+    asset_scope_conditions,
+    is_self_only,
+    scoped_dept_ids,
+)
 
 _TREND_MONTHS = 12
 _CONTRACT_REMINDER_DAYS = 30
@@ -68,8 +74,10 @@ class DashboardService:
         period_start = datetime(period_year, period_month, 1)
 
         allowed_dept_ids = await self._dept_scope(context, dept_id)
-        conditions = await asset_scope_conditions(self.session, context)
-        if allowed_dept_ids is not None:
+        conditions = await asset_scope_conditions(
+            self.session, context, resource="report"
+        )
+        if not is_self_only(context, "report") and allowed_dept_ids is not None:
             if not allowed_dept_ids:
                 conditions.append(false())
             else:
@@ -89,13 +97,17 @@ class DashboardService:
             status_counts[status] = int(count)
         total_assets = sum(status_counts.values())
 
-        total_value = float(
-            await self.session.scalar(
-                select(func.coalesce(func.sum(Asset.purchase_price), 0)).where(
-                    *conditions
+        total_value = (
+            float(
+                await self.session.scalar(
+                    select(func.coalesce(func.sum(Asset.purchase_price), 0)).where(
+                        *conditions
+                    )
                 )
+                or 0
             )
-            or 0
+            if context.can_view_field("asset", "purchase_price")
+            else 0.0
         )
 
         warranty_30d = int(
@@ -128,16 +140,18 @@ class DashboardService:
         category_distribution = await self._category_distribution(conditions)
         dept_distribution = await self._dept_distribution(conditions)
         purchase_trend = await self._purchase_trend(conditions, today, months)
-        warranty_expiring = await self._warranty_expiring(conditions, today)
-        recent_assets = await self._recent_assets(conditions)
+        warranty_expiring = await self._warranty_expiring(conditions, today, context)
+        recent_assets = await self._recent_assets(conditions, context)
         dept_options = await self._dept_options(context)
 
-        month_inbound = await self._inbound_quantity(allowed_dept_ids, month_start)
+        month_inbound = await self._inbound_quantity(
+            context, allowed_dept_ids, month_start
+        )
         month_requisition = await self._requisition_count(
-            allowed_dept_ids, month_start
+            context, allowed_dept_ids, month_start
         )
         contract_expiring = await self._contract_expiring_count(
-            allowed_dept_ids, today
+            context, allowed_dept_ids, today
         )
         idle_count = status_counts.get(AssetStatus.IDLE, 0)
         idle_rate = (
@@ -177,17 +191,17 @@ class DashboardService:
             warranty_expiring=warranty_expiring,
             recent_assets=recent_assets,
             data_scope_label=DATA_SCOPE_LABELS.get(
-                context.data_scope, context.data_scope
+                context.effective_scope("report"), context.effective_scope("report")
             ),
             period=DashboardPeriod(
                 months=months,
                 start_date=period_start.date(),
                 new_assets=period_new_assets,
                 inbound=await self._inbound_quantity(
-                    allowed_dept_ids, period_start
+                    context, allowed_dept_ids, period_start
                 ),
                 requisition=await self._requisition_count(
-                    allowed_dept_ids, period_start
+                    context, allowed_dept_ids, period_start
                 ),
             ),
             dept_options=dept_options,
@@ -199,7 +213,7 @@ class DashboardService:
         context: AuthContext,
         dept_id: int | None,
     ) -> set[int] | None:
-        allowed = await scoped_dept_ids(self.session, context)
+        allowed = await scoped_dept_ids(self.session, context, resource="report")
         if dept_id is None:
             return allowed
         depts = list((await self.session.execute(select(Dept))).scalars().all())
@@ -214,7 +228,7 @@ class DashboardService:
         return allowed & subtree
 
     async def _dept_options(self, context: AuthContext) -> list[DashboardDeptOption]:
-        allowed = await scoped_dept_ids(self.session, context)
+        allowed = await scoped_dept_ids(self.session, context, resource="report")
         stmt = (
             select(Dept)
             .where(Dept.status == 1)
@@ -237,6 +251,7 @@ class DashboardService:
 
     async def _inbound_quantity(
         self,
+        context: AuthContext,
         allowed_dept_ids: set[int] | None,
         since: datetime,
     ) -> int:
@@ -245,14 +260,26 @@ class DashboardService:
             AssetInbound.confirmed_at.is_not(None),
             AssetInbound.confirmed_at >= since,
         )
-        if allowed_dept_ids is not None:
+        if is_self_only(context, "report"):
+            stmt = stmt.where(AssetInbound.created_by_id == context.user.id)
+        elif allowed_dept_ids is not None:
             if not allowed_dept_ids:
                 return 0
             stmt = stmt.where(AssetInbound.dept_id.in_(allowed_dept_ids))
+        domains = context.allowed_domains("report")
+        if domains is not None:
+            stmt = stmt.where(
+                AssetInbound.id.in_(
+                    select(AssetInboundItem.inbound_id)
+                    .join(AssetCategory, AssetCategory.id == AssetInboundItem.category_id)
+                    .where(AssetCategory.asset_domain.in_(domains))
+                )
+            )
         return int(await self.session.scalar(stmt) or 0)
 
     async def _requisition_count(
         self,
+        context: AuthContext,
         allowed_dept_ids: set[int] | None,
         since: datetime,
     ) -> int:
@@ -262,14 +289,26 @@ class DashboardService:
             AssetRequest.outbound_at.is_not(None),
             AssetRequest.outbound_at >= since,
         )
-        if allowed_dept_ids is not None:
+        if is_self_only(context, "report"):
+            stmt = stmt.where(AssetRequest.applicant_id == context.user.id)
+        elif allowed_dept_ids is not None:
             if not allowed_dept_ids:
                 return 0
             stmt = stmt.where(AssetRequest.applicant_dept_id.in_(allowed_dept_ids))
+        domains = context.allowed_domains("report")
+        if domains is not None:
+            stmt = stmt.where(
+                AssetRequest.category_id.in_(
+                    select(AssetCategory.id).where(
+                        AssetCategory.asset_domain.in_(domains)
+                    )
+                )
+            )
         return int(await self.session.scalar(stmt) or 0)
 
     async def _contract_expiring_count(
         self,
+        context: AuthContext,
         allowed_dept_ids: set[int] | None,
         today: date,
     ) -> int:
@@ -278,10 +317,27 @@ class DashboardService:
             AssetContract.end_date >= today,
             AssetContract.end_date <= today + timedelta(days=_CONTRACT_REMINDER_DAYS),
         )
-        if allowed_dept_ids is not None:
+        if is_self_only(context, "report"):
+            stmt = stmt.where(
+                or_(
+                    AssetContract.owner_id == context.user.id,
+                    AssetContract.created_by_id == context.user.id,
+                )
+            )
+        elif allowed_dept_ids is not None:
             if not allowed_dept_ids:
                 return 0
             stmt = stmt.where(AssetContract.dept_id.in_(allowed_dept_ids))
+        domains = context.allowed_domains("report")
+        if domains is not None:
+            stmt = stmt.where(
+                AssetContract.id.in_(
+                    select(AssetContractAsset.contract_id)
+                    .join(Asset, Asset.id == AssetContractAsset.asset_id)
+                    .join(AssetCategory, AssetCategory.id == Asset.category_id)
+                    .where(AssetCategory.asset_domain.in_(domains))
+                )
+            )
         return int(await self.session.scalar(stmt) or 0)
 
     async def _category_distribution(self, conditions: list) -> list[CategorySlice]:
@@ -380,7 +436,10 @@ class DashboardService:
         self,
         conditions: list,
         today: date,
+        context: AuthContext,
     ) -> list[WarrantyItem]:
+        if not context.can_view_field("asset", "warranty_end"):
+            return []
         limit_date = today + timedelta(days=60)
         assets = list(
             (
@@ -400,14 +459,20 @@ class DashboardService:
             .scalars()
             .all()
         )
+        name_visible = context.can_view_field("asset", "name")
+        custodian_visible = context.can_view_field("asset", "custodian_id")
         return [
             WarrantyItem(
                 id=asset.id,
                 asset_no=asset.asset_no,
-                name=asset.name,
+                name=asset.name if name_visible else "已隐藏",
                 category_name=asset.category.name if asset.category else None,
                 dept_name=asset.dept.name if asset.dept else None,
-                custodian_name=asset.custodian.real_name if asset.custodian else None,
+                custodian_name=(
+                    asset.custodian.real_name
+                    if custodian_visible and asset.custodian
+                    else None
+                ),
                 warranty_end=asset.warranty_end,
                 days_left=(asset.warranty_end - today).days,
             )
@@ -415,7 +480,9 @@ class DashboardService:
             if asset.warranty_end is not None
         ]
 
-    async def _recent_assets(self, conditions: list) -> list[RecentAssetItem]:
+    async def _recent_assets(
+        self, conditions: list, context: AuthContext
+    ) -> list[RecentAssetItem]:
         assets = list(
             (
                 await self.session.execute(
@@ -428,11 +495,12 @@ class DashboardService:
             .scalars()
             .all()
         )
+        name_visible = context.can_view_field("asset", "name")
         return [
             RecentAssetItem(
                 id=asset.id,
                 asset_no=asset.asset_no,
-                name=asset.name,
+                name=asset.name if name_visible else "已隐藏",
                 category_name=asset.category.name if asset.category else None,
                 dept_name=asset.dept.name if asset.dept else None,
                 status=asset.status,

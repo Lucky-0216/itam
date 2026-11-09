@@ -1,6 +1,7 @@
 from datetime import datetime
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     Boolean,
     Column,
@@ -15,8 +16,9 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.core.permissions import DataScope
+from app.core.permissions import DataScope, DomainScope
 from app.models.base import Base, IdMixin, TimestampMixin, VersionMixin
+from app.models.domain import AssetDomain
 
 user_roles = Table(
     "sys_user_roles",
@@ -75,6 +77,9 @@ class Dept(Base, IdMixin, TimestampMixin, VersionMixin):
     remark: Mapped[str | None] = mapped_column(String(255))
     source: Mapped[str] = mapped_column(String(10), nullable=False, default="local")
     ldap_dn: Mapped[str | None] = mapped_column(String(512))
+    ldap_synced_at: Mapped[datetime | None] = mapped_column(DateTime)
+    dingtalk_dept_id: Mapped[str | None] = mapped_column(String(64), unique=True)
+    dingtalk_synced_at: Mapped[datetime | None] = mapped_column(DateTime)
 
     manager: Mapped["User | None"] = relationship(
         "User",
@@ -120,6 +125,8 @@ class User(Base, IdMixin, TimestampMixin, VersionMixin):
     ldap_dn: Mapped[str | None] = mapped_column(String(512))
     ldap_uid: Mapped[str | None] = mapped_column(String(255))
     ldap_synced_at: Mapped[datetime | None] = mapped_column(DateTime)
+    dingtalk_userid: Mapped[str | None] = mapped_column(String(128), unique=True)
+    dingtalk_synced_at: Mapped[datetime | None] = mapped_column(DateTime)
 
     dept: Mapped[Dept | None] = relationship(
         "Dept",
@@ -131,6 +138,19 @@ class User(Base, IdMixin, TimestampMixin, VersionMixin):
         secondary=user_roles,
         lazy="selectin",
     )
+
+
+class OrgSyncPolicy(Base, IdMixin, TimestampMixin, VersionMixin):
+    __tablename__ = "sys_org_sync_policies"
+
+    source_priority: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="ldap,dingtalk,local"
+    )
+    conflict_strategy: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="fill_empty"
+    )
+    protect_local: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    disable_scope: Mapped[str] = mapped_column(String(20), nullable=False, default="own")
 
 
 class Role(Base, IdMixin, TimestampMixin, VersionMixin):
@@ -145,6 +165,11 @@ class Role(Base, IdMixin, TimestampMixin, VersionMixin):
         nullable=False,
         default=DataScope.SELF,
     )
+    domain_scope: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default=DomainScope.CUSTOM,
+    )
     status: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=1)
     sort: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     is_system: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -157,6 +182,18 @@ class Role(Base, IdMixin, TimestampMixin, VersionMixin):
     depts: Mapped[list[Dept]] = relationship(
         "Dept",
         secondary=role_depts,
+        lazy="selectin",
+    )
+    data_permissions: Mapped[list["RoleDataPermission"]] = relationship(
+        "RoleDataPermission",
+        back_populates="role",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+    domain_grants: Mapped[list["RoleDomain"]] = relationship(
+        "RoleDomain",
+        back_populates="role",
+        cascade="all, delete-orphan",
         lazy="selectin",
     )
 
@@ -204,10 +241,55 @@ class RoleFieldPermission(Base, IdMixin, TimestampMixin):
     can_edit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
+class RoleDomain(Base, IdMixin, TimestampMixin):
+    __tablename__ = "sys_role_domains"
+    __table_args__ = (
+        UniqueConstraint("role_id", "domain_id", name="uq_role_domain"),
+        Index("ix_sys_role_domains_role_id", "role_id"),
+    )
+
+    role_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("sys_roles.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    domain_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("ast_domains.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    role: Mapped[Role] = relationship("Role", back_populates="domain_grants")
+    domain: Mapped[AssetDomain] = relationship("AssetDomain", lazy="joined")
+
+
+class RoleDataPermission(Base, IdMixin, TimestampMixin):
+    """角色在单个资源上的数据范围；未配置时沿用 Role.data_scope。"""
+
+    __tablename__ = "sys_role_data_permissions"
+    __table_args__ = (
+        UniqueConstraint("role_id", "resource", name="uq_role_data_permission"),
+        Index("ix_sys_role_data_permissions_role_id", "role_id"),
+    )
+
+    role_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("sys_roles.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    resource: Mapped[str] = mapped_column(String(50), nullable=False)
+    data_scope: Mapped[str] = mapped_column(String(20), nullable=False, default=DataScope.SELF)
+    dept_ids: Mapped[list[int] | None] = mapped_column(JSON)
+
+    role: Mapped[Role] = relationship("Role", back_populates="data_permissions")
+
+
 __all__ = [
     "Dept",
     "Menu",
     "Role",
+    "RoleDataPermission",
+    "RoleDomain",
     "RoleFieldPermission",
     "User",
     "role_depts",

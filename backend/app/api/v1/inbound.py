@@ -32,7 +32,7 @@ async def inbound_categories(
     context: AuthContext = Depends(require_perm("asset:inbound:create")),
     session: AsyncSession = Depends(get_db),
 ):
-    result = await InboundService(session).option_categories()
+    result = await InboundService(session).option_categories(context)
     return ok(result)
 
 
@@ -42,7 +42,7 @@ async def inbound_models(
     context: AuthContext = Depends(require_perm("asset:inbound:create")),
     session: AsyncSession = Depends(get_db),
 ):
-    result = await InboundService(session).option_models(category_id)
+    result = await InboundService(session).option_models(context, category_id)
     return ok(result)
 
 
@@ -102,7 +102,9 @@ async def inbound_detail(
 async def update_inbound(
     inbound_id: int,
     payload: InboundUpdate,
-    context: AuthContext = Depends(require_perm("asset:inbound:create")),
+    context: AuthContext = Depends(
+        require_any_perm("asset:inbound:update", "asset:inbound:create")
+    ),
     session: AsyncSession = Depends(get_db),
 ):
     result = await InboundService(session).update_inbound(
@@ -145,7 +147,11 @@ async def cancel_inbound(
     inbound_id: int,
     payload: InboundCancelPayload,
     context: AuthContext = Depends(
-        require_any_perm("asset:inbound:cancel", "asset:inbound:create")
+        require_any_perm(
+            "asset:inbound:cancel",
+            "asset:inbound:delete",
+            "asset:inbound:create",
+        )
     ),
     session: AsyncSession = Depends(get_db),
 ):
@@ -193,5 +199,5 @@ async def stock_categories(
     context: AuthContext = Depends(require_perm("asset:stock:view")),
     session: AsyncSession = Depends(get_db),
 ):
-    result = await StockService(session).categories()
+    result = await StockService(session).categories(context)
     return ok(result)

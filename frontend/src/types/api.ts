@@ -78,6 +78,12 @@ export interface CurrentUser {
   data_scope: string
   data_scope_label: string
   custom_dept_ids: number[]
+  /** 角色级资产域范围：ALL=显式全部域；CUSTOM 时以 asset_domains 为准。 */
+  domain_scope: string
+  /** CUSTOM 且为空数组时表示无任何资产域权限，不得视为不限。 */
+  asset_domains: string[]
+  /** 资源 → 细化后的数据范围；未包含的资源沿用 data_scope。 */
+  resource_scopes: Record<string, string>
   menus: MenuNode[]
   field_permissions: Record<string, Record<string, FieldPermission>>
 }

@@ -15,7 +15,11 @@ class RoleRepository(BaseRepository[Role]):
     async def get_with_relations(self, role_id: int) -> Role | None:
         stmt = (
             select(Role)
-            .options(selectinload(Role.menus), selectinload(Role.depts))
+            .options(
+                selectinload(Role.menus),
+                selectinload(Role.depts),
+                selectinload(Role.domain_grants),
+            )
             .where(Role.id == role_id)
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
@@ -29,7 +33,10 @@ class RoleRepository(BaseRepository[Role]):
             return []
         stmt = (
             select(Role)
-            .options(selectinload(Role.menus))
+            .options(
+                selectinload(Role.menus),
+                selectinload(Role.domain_grants),
+            )
             .where(Role.id.in_(role_ids))
             .order_by(Role.sort, Role.id)
         )
@@ -75,6 +82,7 @@ class RoleRepository(BaseRepository[Role]):
                 func.coalesce(user_count_sq.c.cnt, 0),
                 func.coalesce(menu_count_sq.c.cnt, 0),
             )
+            .options(selectinload(Role.domain_grants))
             .outerjoin(user_count_sq, user_count_sq.c.role_id == Role.id)
             .outerjoin(menu_count_sq, menu_count_sq.c.role_id == Role.id)
             .where(*conditions)

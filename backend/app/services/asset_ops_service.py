@@ -48,8 +48,15 @@ from app.schemas.asset_ops import (
 )
 from app.services.asset_snapshot import asset_snapshot
 from app.services.audit_service import AuditService
+from app.services import dingtalk_approval
+from app.services.dingtalk_approval import LINK_RUNNING
 from app.services.permission_service import AuthContext
-from app.services.scope_service import scoped_dept_ids
+from app.services.scope_service import (
+    asset_domain_condition,
+    category_domain_allowed,
+    is_self_only,
+    scoped_dept_ids,
+)
 from app.services.txn import commit_or_conflict
 
 STATUS_CONFLICT_MESSAGE = "资产状态已变更，请刷新后重试"
@@ -105,15 +112,81 @@ class AssetOpsService:
             raise NotFoundError("报废单不存在")
         return item
 
-    async def _allowed_depts(self, context: AuthContext) -> set[int] | None:
-        return await scoped_dept_ids(self.session, context)
+    async def _allowed_depts(
+        self, context: AuthContext, resource: str
+    ) -> set[int] | None:
+        return await scoped_dept_ids(self.session, context, resource=resource)
+
+    @staticmethod
+    def _option_resources(context: AuthContext) -> list[str]:
+        resources: list[str] = []
+        if context.has_permission("asset:transfer:create"):
+            resources.append("transfer")
+        if context.has_permission("asset:scrap:create"):
+            resources.append("scrap")
+        if context.has_permission("asset:inventory:create"):
+            resources.append("inventory")
+        return resources or ["transfer"]
+
+    async def _option_allowed_depts(
+        self, context: AuthContext, resources: list[str]
+    ) -> set[int] | None:
+        merged: set[int] = set()
+        for resource in resources:
+            allowed = await self._allowed_depts(context, resource)
+            if allowed is None:
+                return None
+            merged |= allowed
+        return merged
+
+    @staticmethod
+    def _option_domains(
+        context: AuthContext, resources: list[str]
+    ) -> tuple[str, ...] | None:
+        merged: set[str] = set()
+        for resource in resources:
+            domains = context.allowed_domains(resource)
+            if domains is None:
+                return None
+            merged.update(domains)
+        return tuple(sorted(merged))
+
+    @staticmethod
+    def _domain_condition(column, context: AuthContext, resource: str):
+        domain_condition = asset_domain_condition(context, resource)
+        if domain_condition is None:
+            return None
+        return column.in_(select(Asset.id).where(domain_condition))
 
     @staticmethod
     def _in_scope(dept_id: int | None, allowed: set[int] | None) -> bool:
         return allowed is None or (dept_id is not None and dept_id in allowed)
 
-    async def _assert_asset_scope(self, asset: Asset, context: AuthContext) -> None:
-        allowed = await self._allowed_depts(context)
+    @staticmethod
+    def _in_record_domain(item, context: AuthContext, resource: str) -> bool:
+        return category_domain_allowed(item.asset.category, context, resource)
+
+    def _record_in_scope(
+        self, item, context: AuthContext, resource: str, allowed: set[int] | None
+    ) -> bool:
+        if is_self_only(context, resource):
+            return item.applicant_id == context.user.id
+        return self._in_scope(item.from_dept_id, allowed)
+
+    def _assert_record_domain(self, item, context: AuthContext, resource: str) -> None:
+        if not self._in_record_domain(item, context, resource):
+            raise PermissionDenied("无权操作该分类下的业务单据")
+
+    async def _assert_asset_scope(
+        self, asset: Asset, context: AuthContext, resource: str
+    ) -> None:
+        if not category_domain_allowed(asset.category, context, resource):
+            raise PermissionDenied("无权操作该分类下的资产")
+        if is_self_only(context, resource):
+            if context.user.id not in (asset.custodian_id, asset.created_by_id):
+                raise PermissionDenied("无权操作该资产")
+            return
+        allowed = await self._allowed_depts(context, resource)
         if allowed is not None and asset.dept_id not in allowed:
             raise PermissionDenied("无权操作该部门的资产")
 
@@ -181,8 +254,14 @@ class AssetOpsService:
         allowed: set[int] | None,
     ) -> AssetTransferOut:
         asset = item.asset
-        in_scope = self._in_scope(item.from_dept_id, allowed)
+        in_scope = self._record_in_scope(
+            item, context, "transfer", allowed
+        ) and category_domain_allowed(asset.category, context, "transfer")
         can_review = context.has_permission("asset:transfer:approve") and in_scope
+        dingtalk = item.__dict__.get("dingtalk_approval")
+        dingtalk_running = bool(
+            dingtalk is not None and dingtalk.status == LINK_RUNNING
+        )
         can_cancel = False
         if item.status == TransferStatus.PENDING_APPROVAL:
             can_cancel = (
@@ -221,11 +300,20 @@ class AssetOpsService:
             approver_name=item.approver_name,
             approved_at=item.approved_at,
             approval_comment=item.approval_comment,
+            dingtalk_instance_id=(
+                dingtalk.process_instance_id if dingtalk is not None else None
+            ),
+            dingtalk_status=dingtalk.status if dingtalk is not None else None,
+            dingtalk_result=dingtalk.result if dingtalk is not None else None,
             completed_by_name=item.completed_by_name,
             completed_at=item.completed_at,
             completion_comment=item.completion_comment,
-            can_approve=item.status == TransferStatus.PENDING_APPROVAL and can_review,
-            can_reject=item.status == TransferStatus.PENDING_APPROVAL and can_review,
+            can_approve=item.status == TransferStatus.PENDING_APPROVAL
+            and can_review
+            and not dingtalk_running,
+            can_reject=item.status == TransferStatus.PENDING_APPROVAL
+            and can_review
+            and not dingtalk_running,
             can_confirm=item.status == TransferStatus.PENDING_TRANSFER
             and context.has_permission("asset:transfer:confirm")
             and in_scope,
@@ -242,7 +330,9 @@ class AssetOpsService:
         allowed: set[int] | None,
     ) -> AssetScrapOut:
         asset = item.asset
-        in_scope = self._in_scope(item.from_dept_id, allowed)
+        in_scope = self._record_in_scope(
+            item, context, "scrap", allowed
+        ) and category_domain_allowed(asset.category, context, "scrap")
         can_review = context.has_permission("asset:scrap:approve") and in_scope
         can_cancel = (
             item.status == ScrapStatus.PENDING_APPROVAL
@@ -297,7 +387,9 @@ class AssetOpsService:
         )
 
     async def option_departments(self, context: AuthContext) -> list[dict[str, object]]:
-        allowed = await self._allowed_depts(context)
+        allowed = await self._option_allowed_depts(
+            context, self._option_resources(context)
+        )
         conditions: list = [Dept.status == 1]
         if allowed is not None:
             conditions.append(Dept.id.in_(allowed) if allowed else false())
@@ -324,7 +416,9 @@ class AssetOpsService:
     async def option_users(
         self, context: AuthContext, keyword: str | None
     ) -> list[dict[str, object]]:
-        allowed = await self._allowed_depts(context)
+        allowed = await self._option_allowed_depts(
+            context, self._option_resources(context)
+        )
         conditions: list = [User.status == 1]
         if allowed is not None:
             conditions.append(User.dept_id.in_(allowed) if allowed else false())
@@ -358,11 +452,17 @@ class AssetOpsService:
         ]
 
     async def option_categories(self, context: AuthContext) -> list[dict[str, object]]:
+        domains = self._option_domains(
+            context, self._option_resources(context)
+        )
+        conditions: list = [AssetCategory.status == 1]
+        if domains is not None:
+            conditions.append(AssetCategory.asset_domain.in_(domains))
         rows = list(
             (
                 await self.session.execute(
                     select(AssetCategory)
-                    .where(AssetCategory.status == 1)
+                    .where(*conditions)
                     .order_by(AssetCategory.path, AssetCategory.sort, AssetCategory.id)
                 )
             )
@@ -389,7 +489,8 @@ class AssetOpsService:
         page: int,
         page_size: int,
     ) -> tuple[list[OpsAssetOut], int]:
-        allowed = await self._allowed_depts(context)
+        resource = "transfer" if purpose == "transfer" else "scrap"
+        allowed = await self._allowed_depts(context, resource)
         conditions: list = [
             Asset.deleted_at.is_(None),
             Asset.status.notin_(
@@ -401,7 +502,17 @@ class AssetOpsService:
                 )
             ),
         ]
-        if allowed is not None:
+        domain_condition = asset_domain_condition(context, resource)
+        if domain_condition is not None:
+            conditions.append(domain_condition)
+        if is_self_only(context, resource):
+            conditions.append(
+                or_(
+                    Asset.custodian_id == context.user.id,
+                    Asset.created_by_id == context.user.id,
+                )
+            )
+        elif allowed is not None:
             conditions.append(Asset.dept_id.in_(allowed) if allowed else false())
         if keyword:
             like = f"%{keyword.strip()}%"
@@ -488,9 +599,16 @@ class AssetOpsService:
         page: int,
         page_size: int,
     ) -> AssetTransferPageOut:
-        allowed = await self._allowed_depts(context)
+        allowed = await self._allowed_depts(context, "transfer")
         conditions: list = []
-        if allowed is not None:
+        domain_condition = self._domain_condition(
+            AssetTransfer.asset_id, context, "transfer"
+        )
+        if domain_condition is not None:
+            conditions.append(domain_condition)
+        if is_self_only(context, "transfer"):
+            conditions.append(AssetTransfer.applicant_id == context.user.id)
+        elif allowed is not None:
             conditions.append(
                 AssetTransfer.from_dept_id.in_(allowed) if allowed else false()
             )
@@ -533,7 +651,7 @@ class AssetOpsService:
         self, payload: TransferCreate, context: AuthContext
     ) -> AssetTransferOut:
         asset = await self._get_asset(payload.asset_id)
-        await self._assert_asset_scope(asset, context)
+        await self._assert_asset_scope(asset, context, "transfer")
         await self._assert_asset_operable(asset)
         await self._assert_no_active_business(asset.id)
         active = await self.session.scalar(
@@ -587,33 +705,81 @@ class AssetOpsService:
         )
         self.session.add(item)
         await self.session.flush()
+        dingtalk_link = None
+        config = await dingtalk_approval.get_approval_config(self.session)
+        if dingtalk_approval.channel_enabled(
+            config, dingtalk_approval.DOC_TYPE_TRANSFER, context.user
+        ):
+            dingtalk_link = await dingtalk_approval.create_instance(
+                self.session,
+                config,
+                doc_type=dingtalk_approval.DOC_TYPE_TRANSFER,
+                doc_no=item.transfer_no,
+                title=f"IT资产调拨申请：{item.transfer_no}",
+                originator_userid=context.user.dingtalk_userid,
+                form_values=[
+                    {"name": "申请人", "value": _user_name(context.user)},
+                    {"name": "调出部门", "value": item.from_dept_name or ""},
+                    {"name": "调入部门", "value": item.to_dept_name or ""},
+                    {
+                        "name": "资产",
+                        "value": f"{asset.name}（{asset.asset_no}）",
+                    },
+                    {"name": "调拨事由", "value": payload.reason or ""},
+                ],
+                transfer_id=item.id,
+            )
+            item.dingtalk_approval = dingtalk_link
         item.asset = asset
         await self.audit.record(
             action="asset.transfer.create",
             module="asset",
-            summary=f"发起调拨：{asset.name}（{asset.asset_no}）",
+            summary=(
+                f"发起调拨：{asset.name}（{asset.asset_no}）"
+                + ("（钉钉审批）" if dingtalk_link is not None else "")
+            ),
             actor=context.user,
             resource_type="asset_transfer",
             resource_id=item.id,
-            after={"status": item.status, "to_dept": dept_name, "to_custodian": custodian_name},
+            after={
+                "status": item.status,
+                "to_dept": dept_name,
+                "to_custodian": custodian_name,
+                "dingtalk_instance_id": (
+                    dingtalk_link.process_instance_id
+                    if dingtalk_link is not None
+                    else None
+                ),
+            },
         )
         await commit_or_conflict(self.session, message=STATUS_CONFLICT_MESSAGE, code=40911)
-        return self._transfer_out(item, context, await self._allowed_depts(context))
+        return self._transfer_out(item, context, await self._allowed_depts(context, "transfer"))
 
     async def get_transfer(self, transfer_id: int, context: AuthContext) -> AssetTransferOut:
         item = await self._get_transfer(transfer_id)
-        allowed = await self._allowed_depts(context)
+        allowed = await self._allowed_depts(context, "transfer")
+        self._assert_record_domain(item, context, "transfer")
+        if not self._record_in_scope(item, context, "transfer", allowed):
+            raise PermissionDenied("无权查看该调拨单")
         return self._transfer_out(item, context, allowed)
 
     async def approve_transfer(
         self, transfer_id: int, comment: str | None, context: AuthContext
     ) -> AssetTransferOut:
         item = await self._get_transfer(transfer_id)
-        allowed = await self._allowed_depts(context)
-        if not self._in_scope(item.from_dept_id, allowed):
-            raise PermissionDenied("无权审批该部门的调拨单")
+        allowed = await self._allowed_depts(context, "transfer")
+        if not self._record_in_scope(
+            item, context, "transfer", allowed
+        ) or not self._in_record_domain(
+            item, context, "transfer"
+        ):
+            raise PermissionDenied("无权审批该调拨单")
         if item.status != TransferStatus.PENDING_APPROVAL:
             raise BizError("当前调拨单不在待审批状态")
+        if await dingtalk_approval.has_running_link(
+            self.session, transfer_id=item.id
+        ):
+            raise BizError("该调拨单已提交钉钉审批，请在钉钉中处理")
         item.status = TransferStatus.PENDING_TRANSFER
         item.approver_id = context.user.id
         item.approver_name = _user_name(context.user)
@@ -636,11 +802,19 @@ class AssetOpsService:
         self, transfer_id: int, comment: str | None, context: AuthContext
     ) -> AssetTransferOut:
         item = await self._get_transfer(transfer_id)
-        allowed = await self._allowed_depts(context)
-        if not self._in_scope(item.from_dept_id, allowed):
-            raise PermissionDenied("无权审批该部门的调拨单")
+        allowed = await self._allowed_depts(context, "transfer")
+        if not self._record_in_scope(
+            item, context, "transfer", allowed
+        ) or not self._in_record_domain(
+            item, context, "transfer"
+        ):
+            raise PermissionDenied("无权审批该调拨单")
         if item.status != TransferStatus.PENDING_APPROVAL:
             raise BizError("当前调拨单不在待审批状态")
+        if await dingtalk_approval.has_running_link(
+            self.session, transfer_id=item.id
+        ):
+            raise BizError("该调拨单已提交钉钉审批，请在钉钉中处理")
         item.status = TransferStatus.REJECTED
         item.approver_id = context.user.id
         item.approver_name = _user_name(context.user)
@@ -662,7 +836,10 @@ class AssetOpsService:
         self, transfer_id: int, context: AuthContext
     ) -> AssetTransferOut:
         item = await self._get_transfer(transfer_id)
-        allowed = await self._allowed_depts(context)
+        allowed = await self._allowed_depts(context, "transfer")
+        self._assert_record_domain(item, context, "transfer")
+        if not self._record_in_scope(item, context, "transfer", allowed):
+            raise PermissionDenied("无权撤销该调拨单")
         if item.status == TransferStatus.PENDING_APPROVAL:
             if (
                 item.applicant_id != context.user.id
@@ -672,7 +849,8 @@ class AssetOpsService:
         elif item.status == TransferStatus.PENDING_TRANSFER:
             if not (
                 context.has_permission("asset:transfer:approve")
-                and self._in_scope(item.from_dept_id, allowed)
+                and self._record_in_scope(item, context, "transfer", allowed)
+                and self._in_record_domain(item, context, "transfer")
             ):
                 raise PermissionDenied("无权撤销已审批的调拨单")
         else:
@@ -699,9 +877,13 @@ class AssetOpsService:
         context: AuthContext,
     ) -> AssetTransferOut:
         item = await self._get_transfer(transfer_id)
-        allowed = await self._allowed_depts(context)
-        if not self._in_scope(item.from_dept_id, allowed):
-            raise PermissionDenied("无权操作该部门的调拨单")
+        allowed = await self._allowed_depts(context, "transfer")
+        if not self._record_in_scope(
+            item, context, "transfer", allowed
+        ) or not self._in_record_domain(
+            item, context, "transfer"
+        ):
+            raise PermissionDenied("无权操作该调拨单")
         if item.status != TransferStatus.PENDING_TRANSFER:
             raise BizError("当前调拨单不在待确认状态")
 
@@ -774,9 +956,16 @@ class AssetOpsService:
         page: int,
         page_size: int,
     ) -> AssetScrapPageOut:
-        allowed = await self._allowed_depts(context)
+        allowed = await self._allowed_depts(context, "scrap")
         conditions: list = []
-        if allowed is not None:
+        domain_condition = self._domain_condition(
+            AssetScrap.asset_id, context, "scrap"
+        )
+        if domain_condition is not None:
+            conditions.append(domain_condition)
+        if is_self_only(context, "scrap"):
+            conditions.append(AssetScrap.applicant_id == context.user.id)
+        elif allowed is not None:
             conditions.append(
                 AssetScrap.from_dept_id.in_(allowed) if allowed else false()
             )
@@ -819,7 +1008,7 @@ class AssetOpsService:
         self, payload: ScrapCreate, context: AuthContext
     ) -> AssetScrapOut:
         asset = await self._get_asset(payload.asset_id)
-        await self._assert_asset_scope(asset, context)
+        await self._assert_asset_scope(asset, context, "scrap")
         await self._assert_asset_operable(asset)
         if asset.status == AssetStatus.PENDING_SCRAP:
             raise BizError("该资产已在待报废状态")
@@ -890,11 +1079,14 @@ class AssetOpsService:
             },
         )
         await commit_or_conflict(self.session, message=STATUS_CONFLICT_MESSAGE, code=40911)
-        return self._scrap_out(item, context, await self._allowed_depts(context))
+        return self._scrap_out(item, context, await self._allowed_depts(context, "scrap"))
 
     async def get_scrap(self, scrap_id: int, context: AuthContext) -> AssetScrapOut:
         item = await self._get_scrap(scrap_id)
-        allowed = await self._allowed_depts(context)
+        allowed = await self._allowed_depts(context, "scrap")
+        self._assert_record_domain(item, context, "scrap")
+        if not self._record_in_scope(item, context, "scrap", allowed):
+            raise PermissionDenied("无权查看该报废单")
         return self._scrap_out(item, context, allowed)
 
     async def approve_scrap(
@@ -904,9 +1096,13 @@ class AssetOpsService:
         context: AuthContext,
     ) -> AssetScrapOut:
         item = await self._get_scrap(scrap_id)
-        allowed = await self._allowed_depts(context)
-        if not self._in_scope(item.from_dept_id, allowed):
-            raise PermissionDenied("无权审批该部门的报废单")
+        allowed = await self._allowed_depts(context, "scrap")
+        if not self._record_in_scope(
+            item, context, "scrap", allowed
+        ) or not self._in_record_domain(
+            item, context, "scrap"
+        ):
+            raise PermissionDenied("无权审批该报废单")
         if item.status != ScrapStatus.PENDING_APPROVAL:
             raise BizError("当前报废单不在待审批状态")
         await self._assert_no_active_business(item.asset_id)
@@ -959,9 +1155,13 @@ class AssetOpsService:
         self, scrap_id: int, comment: str | None, context: AuthContext
     ) -> AssetScrapOut:
         item = await self._get_scrap(scrap_id)
-        allowed = await self._allowed_depts(context)
-        if not self._in_scope(item.from_dept_id, allowed):
-            raise PermissionDenied("无权审批该部门的报废单")
+        allowed = await self._allowed_depts(context, "scrap")
+        if not self._record_in_scope(
+            item, context, "scrap", allowed
+        ) or not self._in_record_domain(
+            item, context, "scrap"
+        ):
+            raise PermissionDenied("无权审批该报废单")
         if item.status != ScrapStatus.PENDING_APPROVAL:
             raise BizError("当前报废单不在待审批状态")
         item.status = ScrapStatus.REJECTED
@@ -985,7 +1185,10 @@ class AssetOpsService:
         self, scrap_id: int, context: AuthContext
     ) -> AssetScrapOut:
         item = await self._get_scrap(scrap_id)
-        allowed = await self._allowed_depts(context)
+        allowed = await self._allowed_depts(context, "scrap")
+        self._assert_record_domain(item, context, "scrap")
+        if not self._record_in_scope(item, context, "scrap", allowed):
+            raise PermissionDenied("无权撤销该报废单")
         if item.status != ScrapStatus.PENDING_APPROVAL:
             raise BizError("仅待审批的报废单可以撤销")
         if (
@@ -1013,9 +1216,13 @@ class AssetOpsService:
         context: AuthContext,
     ) -> AssetScrapOut:
         item = await self._get_scrap(scrap_id)
-        allowed = await self._allowed_depts(context)
-        if not self._in_scope(item.from_dept_id, allowed):
-            raise PermissionDenied("无权操作该部门的报废单")
+        allowed = await self._allowed_depts(context, "scrap")
+        if not self._record_in_scope(
+            item, context, "scrap", allowed
+        ) or not self._in_record_domain(
+            item, context, "scrap"
+        ):
+            raise PermissionDenied("无权操作该报废单")
         if item.status != ScrapStatus.PENDING_DISPOSAL:
             raise BizError("当前报废单不在待处置状态")
 

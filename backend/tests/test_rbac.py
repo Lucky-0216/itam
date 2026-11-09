@@ -60,9 +60,12 @@ async def test_role_authorization_flow_and_data_scope(client: AsyncClient):
     assert menu_map["system:user:create"]["id"] not in role["menu_ids"]
 
     scoped = await client.put(
-        f"/api/v1/roles/{role_id}/data-scope",
+        f"/api/v1/roles/{role_id}/data-permissions",
         json={
             "data_scope": "CUSTOM",
+            "domain_scope": "CUSTOM",
+            "asset_domains": [],
+            "permissions": [],
             "dept_ids": [it_dept["id"]],
             "version": role["version"],
         },
@@ -173,6 +176,95 @@ async def test_role_authorization_flow_and_data_scope(client: AsyncClient):
     assert removed.status_code == 200, removed.text
 
 
+async def test_role_data_permissions_can_be_resaved(client: AsyncClient):
+    tokens = await login(client)
+    headers = auth_headers(tokens["access_token"])
+
+    created = await client.post(
+        "/api/v1/roles",
+        json={
+            "code": "TEST_RESAVE",
+            "name": "重复保存资源数据权限",
+            "description": None,
+            "data_scope": "SELF",
+            "sort": 81,
+            "status": 1,
+        },
+        headers=headers,
+    )
+    assert created.status_code == 200, created.text
+    role = created.json()["data"]
+
+    first = await client.put(
+        f"/api/v1/roles/{role['id']}/data-permissions",
+        json={
+            "data_scope": "SELF",
+            "domain_scope": "CUSTOM",
+            "asset_domains": ["IT"],
+            "permissions": [
+                {"resource": "asset", "data_scope": "SELF"},
+                {"resource": "inbound", "data_scope": "DEPT_AND_CHILD"},
+            ],
+            "dept_ids": [],
+            "version": role["version"],
+        },
+        headers=headers,
+    )
+    assert first.status_code == 200, first.text
+    role = first.json()["data"]
+
+    second = await client.put(
+        f"/api/v1/roles/{role['id']}/data-permissions",
+        json={
+            "data_scope": "SELF",
+            "domain_scope": "CUSTOM",
+            "asset_domains": ["IT", "ADMIN"],
+            "permissions": [
+                {"resource": "asset", "data_scope": "DEPT"},
+                {"resource": "inbound", "data_scope": "SELF"},
+                {"resource": "stock", "data_scope": "DEPT"},
+            ],
+            "dept_ids": [],
+            "version": role["version"],
+        },
+        headers=headers,
+    )
+    assert second.status_code == 200, second.text
+    role = second.json()["data"]
+    assert role["domain_scope"] == "CUSTOM"
+    assert role["asset_domains"] == ["ADMIN", "IT"]
+    assert {
+        (item["resource"], item["data_scope"])
+        for item in role["data_permissions"]
+    } == {
+        ("asset", "DEPT"),
+        ("inbound", "SELF"),
+        ("stock", "DEPT"),
+    }
+
+    third = await client.put(
+        f"/api/v1/roles/{role['id']}/data-permissions",
+        json={
+            "data_scope": "SELF",
+            "domain_scope": "ALL",
+            "asset_domains": [],
+            "permissions": [
+                {"resource": "asset", "data_scope": "SELF"},
+            ],
+            "dept_ids": [],
+            "version": role["version"],
+        },
+        headers=headers,
+    )
+    assert third.status_code == 200, third.text
+    assert third.json()["data"]["domain_scope"] == "ALL"
+    assert third.json()["data"]["asset_domains"] == []
+    assert [
+        (item["resource"], item["data_scope"])
+        for item in third.json()["data"]["data_permissions"]
+    ] == [("asset", "SELF")]
+
+
 async def test_super_admin_role_guards(client: AsyncClient):
     tokens = await login(client)
     headers = auth_headers(tokens["access_token"])
@@ -209,8 +301,15 @@ async def test_super_admin_role_guards(client: AsyncClient):
     assert assign_menu.status_code == 400
 
     assign_data = await client.put(
-        f"/api/v1/roles/{role['id']}/data-scope",
-        json={"data_scope": "SELF", "dept_ids": [], "version": role["version"]},
+        f"/api/v1/roles/{role['id']}/data-permissions",
+        json={
+            "data_scope": "SELF",
+            "domain_scope": "ALL",
+            "asset_domains": [],
+            "permissions": [],
+            "dept_ids": [],
+            "version": role["version"],
+        },
         headers=headers,
     )
     assert assign_data.status_code == 400

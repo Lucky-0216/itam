@@ -97,6 +97,9 @@ export interface TransferItem {
   approver_name: string | null
   approved_at: string | null
   approval_comment: string | null
+  dingtalk_instance_id: string | null
+  dingtalk_status: 'RUNNING' | 'APPROVED' | 'REJECTED' | 'TERMINATED' | null
+  dingtalk_result: string | null
   completed_by_name: string | null
   completed_at: string | null
   completion_comment: string | null

@@ -20,7 +20,7 @@ from app.core.exceptions import BizError, ConflictError, NotFoundError
 from app.core.permissions import SUPER_ADMIN_ROLE
 from app.core.security import hash_password
 from app.core.secrets import decrypt_secret, encrypt_secret
-from app.models import Dept, LdapConfig, LdapSyncLog, Role, User
+from app.models import Dept, LdapConfig, LdapSyncLog, OrgSyncPolicy, Role, User
 from app.models.base import now_cst
 from app.repositories.user_repo import UserRepository
 from app.schemas.ldap import (
@@ -33,6 +33,11 @@ from app.schemas.ldap import (
     LdapTestResult,
 )
 from app.services.audit_service import AuditService
+from app.services.org_policy_service import (
+    OrgSyncPolicyService,
+    can_disable_user,
+    mutation_level,
+)
 from app.services.permission_service import AuthContext
 from app.services.txn import commit_or_conflict
 
@@ -902,6 +907,7 @@ class LdapSyncService:
             "dept_total": 0,
             "dept_created": 0,
             "dept_updated": 0,
+            "dept_skipped": 0,
             "user_total": 0,
             "user_created": 0,
             "user_updated": 0,
@@ -919,11 +925,12 @@ class LdapSyncService:
                 truncated = True
                 details.append({"level": "warning", "message": "日志条目过多，后续明细已省略"})
 
+        policy = await OrgSyncPolicyService(self.session).get_policy()
         dept_by_dn = await self._sync_departments(
-            config, dept_entries, counts, add, details
+            config, policy, dept_entries, counts, add, details
         )
         await self._sync_users(
-            config, user_entries, dept_by_dn, counts, add, details
+            config, policy, user_entries, dept_by_dn, counts, add, details
         )
         await self.session.flush()
         await self._sync_dept_managers(dept_entries, dept_by_dn, counts, add)
@@ -935,6 +942,7 @@ class LdapSyncService:
     async def _sync_departments(
         self,
         config: LdapConfig,
+        policy,
         entries: list[dict[str, Any]],
         counts: dict[str, int],
         add,
@@ -996,6 +1004,7 @@ class LdapSyncService:
                     status=1,
                     source="ldap",
                     ldap_dn=dn,
+                    ldap_synced_at=now_cst(),
                 )
                 codes.add(dept.code)
                 self.session.add(dept)
@@ -1005,22 +1014,32 @@ class LdapSyncService:
                 add("info", f"新增部门：{name}")
                 continue
 
-            changed = False
-            if dept.name != name:
-                dept.name = name
-                changed = True
             target_parent_id = parent_id
             if target_parent_id == dept.id:
                 target_parent_id = None
-            if dept.parent_id != target_parent_id:
-                dept.parent_id = target_parent_id
-                changed = True
-            if dept.status != 1:
-                dept.status = 1
-                changed = True
-            if dept.source != "ldap":
-                dept.source = "ldap"
-                changed = True
+            level = mutation_level(policy, "ldap", dept.source)
+            changed = False
+            if level == "overwrite":
+                if dept.name != name:
+                    dept.name = name
+                    changed = True
+                if dept.parent_id != target_parent_id:
+                    dept.parent_id = target_parent_id
+                    changed = True
+                if dept.status != 1:
+                    dept.status = 1
+                    changed = True
+                if dept.source != "ldap":
+                    dept.source = "ldap"
+                    changed = True
+            elif level == "fill_empty":
+                if dept.parent_id is None and target_parent_id is not None:
+                    dept.parent_id = target_parent_id
+                    changed = True
+            else:
+                counts["dept_skipped"] += 1
+                add("info", f"按同步策略跳过域控部门更新：{dept.name}")
+            dept.ldap_synced_at = now_cst()
             if changed:
                 counts["dept_updated"] += 1
                 add("info", f"更新部门：{name}")
@@ -1041,6 +1060,7 @@ class LdapSyncService:
     async def _sync_users(
         self,
         config: LdapConfig,
+        policy: OrgSyncPolicy,
         entries: list[dict[str, Any]],
         dept_by_dn: dict[str, Dept],
         counts: dict[str, int],
@@ -1071,8 +1091,12 @@ class LdapSyncService:
         employee_map: dict[str, User] = {
             user.employee_no: user for user in users if user.employee_no
         }
-        existing_ldap = [user for user in users if user.source == "ldap" and user.deleted_at is None]
-        if existing_ldap and not entries:
+        disable_candidates = [
+            user
+            for user in users
+            if user.deleted_at is None and can_disable_user(policy, "ldap", user)
+        ]
+        if disable_candidates and not entries:
             raise BizError("域控未返回任何用户，已中止同步以避免误停用账号")
 
         role = await self._default_role(config)
@@ -1177,50 +1201,80 @@ class LdapSyncService:
                 continue
 
             seen_ids.add(existing.id)
+            level = mutation_level(policy, "ldap", existing.source)
             changed: list[str] = []
-            if real_name and existing.real_name != real_name:
-                existing.real_name = real_name
-                changed.append("姓名")
-            if email:
-                resolved_email, conflict = self._claim_unique(
-                    email_map, email, current=existing
-                )
-                if resolved_email and (existing.email or "").lower() != resolved_email.lower():
-                    existing.email = resolved_email.lower()
-                    changed.append("邮箱")
-                if conflict:
-                    add("warning", f"{username} 的新邮箱 {email} 已被其他账号占用，已保留原邮箱")
-            if employee_no:
-                resolved_employee, conflict = self._claim_unique(
-                    employee_map, employee_no, current=existing
-                )
-                if resolved_employee and existing.employee_no != resolved_employee:
-                    existing.employee_no = resolved_employee
-                    changed.append("工号")
-                if conflict:
-                    add("warning", f"{username} 的新工号 {employee_no} 已被其他账号占用，已保留原工号")
-            if phone and existing.phone != phone:
-                existing.phone = phone
-                changed.append("电话")
-            if existing.dept_id != dept_id:
-                existing.dept_id = dept_id
-                changed.append("部门")
-            if existing.status != target_status:
-                if target_status == 0 and await self._is_last_super_admin(existing):
-                    counts["user_skipped"] += 1
-                    add("error", f"{username} 是最后一名超级管理员，已跳过停用以保护系统")
-                else:
-                    existing.status = target_status
-                    if target_status == 0:
-                        existing.token_version += 1
-                        counts["user_disabled"] += 1
-                        add("warning", f"域控账号已停用，系统账号同步停用：{username}")
-                    changed.append("状态")
-            if existing.source != "ldap":
-                existing.source = "ldap"
-                changed.append("来源")
-            if existing.must_change_password:
-                existing.must_change_password = False
+            if level == "overwrite":
+                if real_name and existing.real_name != real_name:
+                    existing.real_name = real_name
+                    changed.append("姓名")
+                if email:
+                    resolved_email, conflict = self._claim_unique(
+                        email_map, email, current=existing
+                    )
+                    if resolved_email and (existing.email or "").lower() != resolved_email.lower():
+                        existing.email = resolved_email.lower()
+                        changed.append("邮箱")
+                    if conflict:
+                        add("warning", f"{username} 的新邮箱 {email} 已被其他账号占用，已保留原邮箱")
+                if employee_no:
+                    resolved_employee, conflict = self._claim_unique(
+                        employee_map, employee_no, current=existing
+                    )
+                    if resolved_employee and existing.employee_no != resolved_employee:
+                        existing.employee_no = resolved_employee
+                        changed.append("工号")
+                    if conflict:
+                        add("warning", f"{username} 的新工号 {employee_no} 已被其他账号占用，已保留原工号")
+                if phone and existing.phone != phone:
+                    existing.phone = phone
+                    changed.append("电话")
+                if existing.dept_id != dept_id:
+                    existing.dept_id = dept_id
+                    changed.append("部门")
+                if existing.status != target_status:
+                    if target_status == 0 and await self._is_last_super_admin(existing):
+                        counts["user_skipped"] += 1
+                        add("error", f"{username} 是最后一名超级管理员，已跳过停用以保护系统")
+                    else:
+                        existing.status = target_status
+                        if target_status == 0:
+                            existing.token_version += 1
+                            counts["user_disabled"] += 1
+                            add("warning", f"域控账号已停用，系统账号同步停用：{username}")
+                        changed.append("状态")
+                if existing.source != "ldap":
+                    existing.source = "ldap"
+                    changed.append("来源")
+                if existing.must_change_password:
+                    existing.must_change_password = False
+            elif level == "fill_empty":
+                if not existing.real_name and real_name:
+                    existing.real_name = real_name
+                    changed.append("姓名")
+                if not existing.email and email:
+                    resolved_email, conflict = self._claim_unique(
+                        email_map, email, current=existing
+                    )
+                    if resolved_email:
+                        existing.email = resolved_email.lower()
+                        changed.append("邮箱")
+                    if conflict:
+                        add("warning", f"{username} 的新邮箱 {email} 已被其他账号占用，已保留原邮箱")
+                if not existing.employee_no and employee_no:
+                    resolved_employee, conflict = self._claim_unique(
+                        employee_map, employee_no, current=existing
+                    )
+                    if resolved_employee:
+                        existing.employee_no = resolved_employee
+                        changed.append("工号")
+                    if conflict:
+                        add("warning", f"{username} 的新工号 {employee_no} 已被其他账号占用，已保留原工号")
+                if not existing.phone and phone:
+                    existing.phone = phone
+                    changed.append("电话")
+            else:
+                counts["user_skipped"] += 1
+                add("info", f"按同步策略跳过域控用户更新：{username}")
             if existing.ldap_dn != (dn or None):
                 existing.ldap_dn = dn or None
             if existing.ldap_uid != uid:
@@ -1230,7 +1284,7 @@ class LdapSyncService:
                 counts["user_updated"] += 1
                 add("info", f"更新域控用户：{real_name}（{'+'.join(changed)}）")
 
-        for user in existing_ldap:
+        for user in disable_candidates:
             if user.id in seen_ids:
                 continue
             if user.status == 0:

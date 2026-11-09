@@ -82,6 +82,7 @@ export interface UserQuery {
   dept_id?: number
   include_child?: boolean
   status?: number
+  source?: string
 }
 
 export interface UserCreatePayload {
@@ -117,5 +118,17 @@ export interface UserStatusPayload {
 
 export interface ResetPasswordPayload {
   new_password: string
+  version: number
+}
+
+export interface SyncPolicy {
+  source_priority: string
+  conflict_strategy: string
+  protect_local: boolean
+  disable_scope: string
+  version: number
+}
+
+export interface SyncPolicyUpdate extends Omit<SyncPolicy, 'version'> {
   version: number
 }

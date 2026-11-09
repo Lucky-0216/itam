@@ -7,6 +7,9 @@ import type {
   AssetBatchVoidResult,
   AssetCategory,
   AssetDeptOption,
+  AssetDomainItem,
+  AssetDomainPayload,
+  AssetDomainUpdatePayload,
   AssetPage,
   AssetPayload,
   AssetQuery,
@@ -28,6 +31,26 @@ import type {
 } from '@/types/asset'
 
 export const assetApi = {
+  listDomains(): Promise<AssetDomainItem[]> {
+    return request<AssetDomainItem[]>({ url: '/asset-domains' })
+  },
+
+  createDomain(payload: AssetDomainPayload): Promise<AssetDomainItem> {
+    return request<AssetDomainItem>({ url: '/asset-domains', method: 'post', data: payload })
+  },
+
+  updateDomain(id: number, payload: AssetDomainUpdatePayload): Promise<AssetDomainItem> {
+    return request<AssetDomainItem>({
+      url: `/asset-domains/${id}`,
+      method: 'put',
+      data: payload,
+    })
+  },
+
+  deleteDomain(id: number): Promise<null> {
+    return request<null>({ url: `/asset-domains/${id}`, method: 'delete' })
+  },
+
   categoryTree(): Promise<AssetCategory[]> {
     return request<AssetCategory[]>({ url: '/asset-categories/tree' })
   },

@@ -208,3 +208,19 @@ class UserPageOut(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+class OrgSyncPolicyUpdate(BaseModel):
+    source_priority: str = Field(min_length=10, max_length=50)
+    conflict_strategy: str = Field(min_length=1, max_length=20)
+    protect_local: bool
+    disable_scope: str = Field(min_length=1, max_length=20)
+    version: int = Field(ge=1)
+
+
+class OrgSyncPolicyOut(BaseModel):
+    source_priority: str
+    conflict_strategy: str
+    protect_local: bool
+    disable_scope: str
+    version: int

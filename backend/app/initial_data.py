@@ -5,14 +5,15 @@ from decimal import Decimal
 from sqlalchemy import insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.assets import CategoryType, FieldType
+from app.core.assets import AssetDomain, CategoryType, FieldType
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
-from app.core.permissions import SUPER_ADMIN_ROLE, DataScope
+from app.core.permissions import SUPER_ADMIN_ROLE, DataScope, DomainScope
 from app.core.security import hash_password
 from app.models import (
     AssetCategory,
     AssetCategoryField,
+    AssetDomain as AssetDomainEntity,
     AssetModel,
     AssetRequestSetting,
     Dept,
@@ -49,6 +50,7 @@ ROLES = [
         "description": "资产台账与资产业务管理",
         "data_scope": DataScope.ALL,
         "sort": 20,
+        "is_system": True,
     },
     {
         "code": "DEPT_ADMIN",
@@ -56,6 +58,7 @@ ROLES = [
         "description": "管理本部门及下级部门资产",
         "data_scope": DataScope.DEPT_AND_CHILD,
         "sort": 30,
+        "is_system": True,
     },
     {
         "code": "EMPLOYEE",
@@ -63,6 +66,7 @@ ROLES = [
         "description": "查看本人名下资产与自助申请",
         "data_scope": DataScope.SELF,
         "sort": 40,
+        "is_system": True,
     },
     {
         "code": "AUDITOR",
@@ -70,6 +74,7 @@ ROLES = [
         "description": "全局只读与审计日志查看",
         "data_scope": DataScope.ALL,
         "sort": 50,
+        "is_system": True,
     },
     {
         "code": "REPAIRER",
@@ -77,6 +82,7 @@ ROLES = [
         "description": "处理指派给自己的维修工单",
         "data_scope": DataScope.SELF,
         "sort": 60,
+        "is_system": True,
     },
 ]
 
@@ -284,6 +290,24 @@ MENUS = [
         "type": "BUTTON",
         "sort": 30,
         "permission_code": "asset:inbound:cancel",
+        "visible": False,
+    },
+    {
+        "key": "asset_inbound_update",
+        "parent": "asset_inbound",
+        "name": "编辑入库单",
+        "type": "BUTTON",
+        "sort": 40,
+        "permission_code": "asset:inbound:update",
+        "visible": False,
+    },
+    {
+        "key": "asset_inbound_delete",
+        "parent": "asset_inbound",
+        "name": "删除入库单",
+        "type": "BUTTON",
+        "sort": 50,
+        "permission_code": "asset:inbound:delete",
         "visible": False,
     },
     {
@@ -900,6 +924,57 @@ MENUS = [
         "visible": False,
     },
     {
+        "key": "dingtalk_sync",
+        "parent": "system",
+        "name": "钉钉同步",
+        "type": "MENU",
+        "path": "/system/dingtalk",
+        "component": "system/dingtalk/index",
+        "icon": "ChatDotRound",
+        "sort": 50,
+        "permission_code": "system:dingtalk:view",
+        "visible": True,
+    },
+    {
+        "key": "dingtalk_update",
+        "parent": "dingtalk_sync",
+        "name": "编辑钉钉配置",
+        "type": "BUTTON",
+        "sort": 10,
+        "permission_code": "system:dingtalk:update",
+        "visible": False,
+    },
+    {
+        "key": "dingtalk_sync_run",
+        "parent": "dingtalk_sync",
+        "name": "手动同步",
+        "type": "BUTTON",
+        "sort": 20,
+        "permission_code": "system:dingtalk:sync",
+        "visible": False,
+    },
+    {
+        "key": "org_sync_policy",
+        "parent": "system",
+        "name": "组织同步策略",
+        "type": "MENU",
+        "path": "/system/org-sync-policy",
+        "component": "system/org-sync-policy/index",
+        "icon": "SetUp",
+        "sort": 55,
+        "permission_code": "system:org-sync-policy:view",
+        "visible": True,
+    },
+    {
+        "key": "org_sync_policy_update",
+        "parent": "org_sync_policy",
+        "name": "编辑同步策略",
+        "type": "BUTTON",
+        "sort": 10,
+        "permission_code": "system:org-sync-policy:update",
+        "visible": False,
+    },
+    {
         "key": "approval_flow_config",
         "parent": "system",
         "name": "审批流程配置",
@@ -981,6 +1056,20 @@ CATEGORY_TREE = [
         "children": [
             {"key": "toner", "name": "打印耗材", "code": "CS-TONER", "sort": 10},
             {"key": "cable", "name": "线缆配件", "code": "CS-CABLE", "sort": 20},
+        ],
+    },
+    {
+        "key": "admin_asset",
+        "name": "行政资产",
+        "code": "ADM-ASSET",
+        "category_type": CategoryType.HARDWARE,
+        "asset_domain": AssetDomain.ADMIN,
+        "sort": 90,
+        "remark": "办公家具、电器等非 IT 类行政资产",
+        "children": [
+            {"key": "admin_furniture", "name": "办公家具", "code": "ADM-FURNITURE", "sort": 10},
+            {"key": "admin_appliance", "name": "办公电器", "code": "ADM-APPLIANCE", "sort": 20},
+            {"key": "admin_other", "name": "其他行政资产", "code": "ADM-OTHER", "sort": 30},
         ],
     },
 ]
@@ -1150,8 +1239,23 @@ async def _ensure_departments(session: AsyncSession) -> dict[str, Dept]:
     return dept_map
 
 
-async def _ensure_roles(session: AsyncSession) -> dict[str, Role]:
+async def _ensure_domains(session: AsyncSession) -> None:
+    for code, name, sort in (("IT", "IT 资产", 10), ("ADMIN", "行政资产", 20)):
+        domain = (
+            await session.execute(
+                select(AssetDomainEntity).where(AssetDomainEntity.code == code)
+            )
+        ).scalar_one_or_none()
+        if domain is None:
+            session.add(
+                AssetDomainEntity(code=code, name=name, sort=sort, is_builtin=True)
+            )
+    await session.flush()
+
+
+async def _ensure_roles(session: AsyncSession) -> tuple[dict[str, Role], set[int]]:
     role_map: dict[str, Role] = {}
+    created_ids: set[int] = set()
     for item in ROLES:
         role = (
             await session.execute(select(Role).where(Role.code == item["code"]))
@@ -1162,14 +1266,18 @@ async def _ensure_roles(session: AsyncSession) -> dict[str, Role]:
                 name=item["name"],
                 description=item.get("description"),
                 data_scope=item["data_scope"],
+                domain_scope=DomainScope.ALL,
                 sort=item.get("sort", 0),
                 is_system=item.get("is_system", False),
                 status=1,
             )
             session.add(role)
             await session.flush()
+            created_ids.add(role.id)
+        elif item.get("is_system") and not role.is_system:
+            role.is_system = True
         role_map[item["code"]] = role
-    return role_map
+    return role_map, created_ids
 
 
 async def _ensure_menus(session: AsyncSession) -> list[Menu]:
@@ -1218,6 +1326,10 @@ async def _ensure_categories(session: AsyncSession) -> dict[str, AssetCategory]:
                 category_type=item.get(
                     "category_type",
                     parent.category_type if parent else CategoryType.HARDWARE,
+                ),
+                asset_domain=item.get(
+                    "asset_domain",
+                    parent.asset_domain if parent else AssetDomain.IT,
                 ),
                 sort=item.get("sort", 0),
                 status=1,
@@ -1360,6 +1472,8 @@ DEFAULT_ROLE_MENUS = {
         "asset:inbound:create",
         "asset:inbound:confirm",
         "asset:inbound:cancel",
+        "asset:inbound:update",
+        "asset:inbound:delete",
         "asset:stock:view",
         "asset:requisition:view",
         "asset:requisition:create",
@@ -1488,11 +1602,14 @@ async def _assign_role_menus(
     session: AsyncSession,
     role_map: dict[str, Role],
     menus: list[Menu],
+    created_role_ids: set[int],
 ) -> None:
     existing = set(
         (await session.execute(select(role_menus.c.role_id, role_menus.c.menu_id))).all()
     )
     for role in role_map.values():
+        if role.id not in created_role_ids:
+            continue
         default_codes = DEFAULT_ROLE_MENUS.get(role.code)
         targets = (
             menus
@@ -1545,9 +1662,10 @@ async def seed_initial_data(session: AsyncSession) -> None:
         fields_created = await _ensure_category_fields(session, category_map)
         model_map = await _ensure_models(session, category_map)
 
-    role_map = await _ensure_roles(session)
+    await _ensure_domains(session)
+    role_map, created_role_ids = await _ensure_roles(session)
     menus = await _ensure_menus(session)
-    await _assign_role_menus(session, role_map, menus)
+    await _assign_role_menus(session, role_map, menus, created_role_ids)
     await _ensure_request_settings(session)
 
     admin = await _ensure_admin(session, dept_map)

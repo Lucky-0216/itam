@@ -118,6 +118,9 @@ export interface AssetRequestItem {
   approved_at: string | null
   approval_comment: string | null
   approvals: ApprovalRecordItem[]
+  dingtalk_instance_id: string | null
+  dingtalk_status: 'RUNNING' | 'APPROVED' | 'REJECTED' | 'TERMINATED' | null
+  dingtalk_result: string | null
   outbound_by_name: string | null
   outbound_at: string | null
   outbound_location: string | null

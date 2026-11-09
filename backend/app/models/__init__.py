@@ -26,6 +26,8 @@ from app.models.asset_ops import (
 from app.models.audit import AuditLog
 from app.models.base import Base
 from app.models.contract import AssetContract, AssetContractAsset
+from app.models.dingtalk import DingTalkApproval, DingTalkConfig, DingTalkSyncLog
+from app.models.domain import AssetDomain
 from app.models.inbound import (
     AssetCodeSequence,
     AssetInbound,
@@ -37,7 +39,10 @@ from app.models.maintenance import AssetMaintenance, AssetMaintenanceRecord
 from app.models.rbac import (
     Dept,
     Menu,
+    OrgSyncPolicy,
     Role,
+    RoleDataPermission,
+    RoleDomain,
     RoleFieldPermission,
     User,
     role_depts,
@@ -57,6 +62,7 @@ __all__ = [
     "AssetCodeSequence",
     "AssetContract",
     "AssetContractAsset",
+    "AssetDomain",
     "AssetHistory",
     "AssetInbound",
     "AssetInboundCode",
@@ -72,6 +78,9 @@ __all__ = [
     "AuditLog",
     "Base",
     "Dept",
+    "DingTalkApproval",
+    "DingTalkConfig",
+    "DingTalkSyncLog",
     "InventoryAdjustment",
     "InventoryItem",
     "InventorySurplus",
@@ -79,7 +88,10 @@ __all__ = [
     "LdapConfig",
     "LdapSyncLog",
     "Menu",
+    "OrgSyncPolicy",
     "Role",
+    "RoleDataPermission",
+    "RoleDomain",
     "RoleFieldPermission",
     "User",
     "role_depts",

@@ -138,8 +138,8 @@ const summaryCards = computed(() => {
   return cards
 })
 
-const canConfigure = computed(
-  () => auth.isSuperAdmin || auth.roleNames.includes('资产管理员'),
+const canConfigure = computed(() =>
+  auth.hasAnyPerm(['asset:request:flow:view', 'asset:request:flow:manage']),
 )
 const approvalConfig = ref<ApprovalConfig | null>(null)
 const configSaving = ref(false)

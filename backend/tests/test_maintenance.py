@@ -299,11 +299,15 @@ async def test_maintenance_full_flow_with_optimistic_lock_and_cross_module_guard
 
 
 async def test_maintenance_cancel_and_reject(client: AsyncClient):
-    await _ensure_user("mnt_cancel_emp", "撤销员工", "EMPLOYEE")
+    employee_id = await _ensure_user("mnt_cancel_emp", "撤销员工", "EMPLOYEE")
     await _ensure_user("mnt_cancel_asset", "撤销资产管理员", "ASSET_ADMIN")
     repairer_id = await _ensure_user("mnt_cancel_rep", "撤销维修员", "REPAIRER")
-    first_asset = await _ensure_asset("ITAM-MNT-0101", "待取消维修台式机")
-    second_asset = await _ensure_asset("ITAM-MNT-0102", "待驳回维修显示器")
+    first_asset = await _ensure_asset(
+        "ITAM-MNT-0101", "待取消维修台式机", custodian_id=employee_id
+    )
+    second_asset = await _ensure_asset(
+        "ITAM-MNT-0102", "待驳回维修显示器", custodian_id=employee_id
+    )
     emp_headers = await _login_as(client, "mnt_cancel_emp")
     asset_headers = await _login_as(client, "mnt_cancel_asset")
 

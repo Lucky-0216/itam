@@ -1,5 +1,6 @@
 export type AssetCategoryType = 'HARDWARE' | 'SOFTWARE' | 'ACCESSORY' | 'CONSUMABLE'
 export type AssetFieldType = 'TEXT' | 'NUMBER' | 'DATE' | 'SELECT'
+export type AssetDomain = string
 export type AssetStatus =
   | 'PENDING_STOCK'
   | 'IN_STOCK'
@@ -10,6 +11,25 @@ export type AssetStatus =
   | 'PENDING_SCRAP'
   | 'SCRAPPED'
   | 'VOIDED'
+
+export interface AssetDomainItem {
+  id: number
+  code: AssetDomain
+  name: string
+  sort: number
+  is_builtin: boolean
+}
+
+export interface AssetDomainPayload {
+  code: AssetDomain
+  name: string
+  sort: number
+}
+
+export interface AssetDomainUpdatePayload {
+  name: string
+  sort: number
+}
 
 export interface CategoryField {
   id: number
@@ -31,6 +51,7 @@ export interface AssetCategory {
   name: string
   code: string
   category_type: AssetCategoryType
+  asset_domain: AssetDomain
   path: string
   level: number
   sort: number
@@ -49,6 +70,7 @@ export interface CategoryPayload {
   name: string
   code: string
   category_type?: AssetCategoryType | null
+  asset_domain?: AssetDomain | null
   sort: number
   safety_stock: number
   status: number
@@ -57,6 +79,7 @@ export interface CategoryPayload {
 
 export interface CategoryUpdatePayload extends CategoryPayload {
   version: number
+  confirm_domain_change?: boolean
 }
 
 export interface CategoryFieldPayload {
@@ -124,6 +147,7 @@ export interface ModelPayload {
 
 export interface ModelUpdatePayload extends ModelPayload {
   version: number
+  confirm_domain_change?: boolean
 }
 
 export interface AssetItem {

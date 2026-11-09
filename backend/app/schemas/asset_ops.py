@@ -118,6 +118,9 @@ class AssetTransferOut(BaseModel):
     approver_name: str | None = None
     approved_at: datetime | None = None
     approval_comment: str | None = None
+    dingtalk_instance_id: str | None = None
+    dingtalk_status: str | None = None
+    dingtalk_result: str | None = None
     completed_by_name: str | None = None
     completed_at: datetime | None = None
     completion_comment: str | None = None

@@ -56,7 +56,12 @@ from app.schemas.asset_ops import (
 from app.services.audit_service import AuditService
 from app.services.asset_snapshot import asset_snapshot
 from app.services.permission_service import AuthContext
-from app.services.scope_service import scoped_dept_ids
+from app.services.scope_service import (
+    asset_domain_condition,
+    category_domain_allowed,
+    is_self_only,
+    scoped_dept_ids,
+)
 from app.services.txn import commit_or_conflict
 
 STATUS_CONFLICT_MESSAGE = "资产状态已变更，请刷新后重试"
@@ -92,10 +97,39 @@ class InventoryService:
         return f"{head}{sequence:04d}"
 
     async def _allowed_depts(self, context: AuthContext) -> set[int] | None:
-        return await scoped_dept_ids(self.session, context)
+        return await scoped_dept_ids(self.session, context, resource="inventory")
 
     @staticmethod
-    def _in_scope(task: InventoryTask, allowed: set[int] | None) -> bool:
+    def _task_domain_condition(context: AuthContext):
+        domains = context.allowed_domains("inventory")
+        if domains is None:
+            return None
+        return InventoryTask.scope_category_id.in_(
+            select(AssetCategory.id).where(
+                AssetCategory.asset_domain.in_(domains)
+            )
+        )
+
+    async def _assert_task_domain(
+        self, task: InventoryTask, context: AuthContext
+    ) -> None:
+        domains = context.allowed_domains("inventory")
+        if domains is None:
+            return
+        category = (
+            await self.session.get(AssetCategory, task.scope_category_id)
+            if task.scope_category_id is not None
+            else None
+        )
+        if category is None or category.asset_domain not in domains:
+            raise PermissionDenied("无权操作该分类下的盘点任务")
+
+    @staticmethod
+    def _in_scope(
+        task: InventoryTask, context: AuthContext, allowed: set[int] | None
+    ) -> bool:
+        if is_self_only(context, "inventory"):
+            return task.created_by_id == context.user.id
         if allowed is None:
             return True
         return task.scope_dept_id is not None and task.scope_dept_id in allowed
@@ -111,8 +145,9 @@ class InventoryService:
     ) -> tuple[InventoryTask, set[int] | None]:
         task = await self._get_task(task_id)
         allowed = await self._allowed_depts(context)
-        if not self._in_scope(task, allowed):
+        if not self._in_scope(task, context, allowed):
             raise PermissionDenied("无权查看该盘点任务")
+        await self._assert_task_domain(task, context)
         return task, allowed
 
     async def _get_task_for_manage(
@@ -153,13 +188,21 @@ class InventoryService:
         return ids
 
     async def _resolve_category_ids(
-        self, scope_category_id: int | None, include_child: bool
+        self,
+        scope_category_id: int | None,
+        include_child: bool,
+        context: AuthContext,
     ) -> set[int] | None:
+        domains = context.allowed_domains("inventory")
         if scope_category_id is None:
+            if domains is not None:
+                raise BizError("当前角色仅可盘点授权资产域，请选择盘点分类")
             return None
         category = await self.session.get(AssetCategory, scope_category_id)
         if category is None:
             raise BizError("盘点范围分类不存在")
+        if not category_domain_allowed(category, context, "inventory"):
+            raise PermissionDenied("无权在该分类范围内创建盘点任务")
         ids = {category.id}
         if include_child:
             rows = (
@@ -170,6 +213,16 @@ class InventoryService:
                 for row in rows
                 if row.id != category.id and row.path.startswith(category.path)
             }
+        if domains is not None:
+            allowed_rows = (
+                await self.session.execute(
+                    select(AssetCategory.id).where(
+                        AssetCategory.id.in_(ids),
+                        AssetCategory.asset_domain.in_(domains),
+                    )
+                )
+            ).scalars()
+            ids &= set(allowed_rows.all())
         return ids
 
     async def _stats(self, task_ids: list[int]) -> dict[int, dict[str, int]]:
@@ -258,7 +311,7 @@ class InventoryService:
         adjustment: InventoryAdjustment | None = None,
     ) -> InventoryTaskOut:
         counts = stats or {}
-        in_scope = self._in_scope(task, allowed)
+        in_scope = self._in_scope(task, context, allowed)
         missing_count = counts.get("missing", 0)
         surplus_count = counts.get("surplus", 0)
         has_pending = bool(
@@ -484,6 +537,8 @@ class InventoryService:
         category = await self.session.get(AssetCategory, payload.category_id)
         if category is None or category.status != 1:
             raise BizError("盘盈资产分类不存在或已停用")
+        if not category_domain_allowed(category, context, "inventory"):
+            raise PermissionDenied("无权登记该分类下的盘盈资产")
         child_count = int(
             await self.session.scalar(
                 select(func.count())
@@ -757,6 +812,8 @@ class InventoryService:
                 purchase_price=row.purchase_price,
                 status=AssetStatus.IN_STOCK,
                 remark=row.remark or f"盘点盘盈（{task.task_no}）",
+                created_by_id=context.user.id,
+                created_by_name=context.user.real_name or context.user.username,
             )
             self.session.add(asset)
             await self.session.flush()
@@ -796,7 +853,7 @@ class InventoryService:
         task, allowed = await self._get_task_for_view(task_id, context)
         if not context.has_permission(APPROVE_PERMISSION):
             raise PermissionDenied("无权审批盘点盈亏处理")
-        if not self._in_scope(task, allowed):
+        if not self._in_scope(task, context, allowed):
             raise PermissionDenied("无权审批该盘点任务")
         adjustment = await self._latest_adjustment(task.id)
         if adjustment is None or adjustment.status != InventoryAdjustmentStatus.PENDING:
@@ -819,7 +876,7 @@ class InventoryService:
         task, allowed = await self._get_task_for_view(task_id, context)
         if not context.has_permission(APPROVE_PERMISSION):
             raise PermissionDenied("无权审批盘点盈亏处理")
-        if not self._in_scope(task, allowed):
+        if not self._in_scope(task, context, allowed):
             raise PermissionDenied("无权审批该盘点任务")
         if not payload.comment:
             raise BizError("请填写驳回原因")
@@ -1011,7 +1068,12 @@ class InventoryService:
     ) -> InventoryTaskPageOut:
         allowed = await self._allowed_depts(context)
         conditions: list = []
-        if allowed is not None:
+        domain_condition = self._task_domain_condition(context)
+        if domain_condition is not None:
+            conditions.append(domain_condition)
+        if is_self_only(context, "inventory"):
+            conditions.append(InventoryTask.created_by_id == context.user.id)
+        elif allowed is not None:
             conditions.append(
                 InventoryTask.scope_dept_id.in_(allowed) if allowed else false()
             )
@@ -1067,11 +1129,14 @@ class InventoryService:
         self, payload: InventoryCreate, context: AuthContext
     ) -> InventoryTaskOut:
         allowed = await self._allowed_depts(context)
+        target_allowed = allowed
+        if is_self_only(context, "inventory"):
+            target_allowed = {context.user.dept_id} if context.user.dept_id else set()
         dept_ids = await self._resolve_dept_ids(
-            payload.scope_dept_id, payload.include_child, allowed
+            payload.scope_dept_id, payload.include_child, target_allowed
         )
         category_ids = await self._resolve_category_ids(
-            payload.scope_category_id, payload.include_child_category
+            payload.scope_category_id, payload.include_child_category, context
         )
 
         dept_name = None
@@ -1087,6 +1152,16 @@ class InventoryService:
             Asset.deleted_at.is_(None),
             Asset.status.notin_((AssetStatus.SCRAPPED, AssetStatus.PENDING_STOCK)),
         ]
+        domain_condition = asset_domain_condition(context, "inventory")
+        if domain_condition is not None:
+            conditions.append(domain_condition)
+        if is_self_only(context, "inventory"):
+            conditions.append(
+                or_(
+                    Asset.custodian_id == context.user.id,
+                    Asset.created_by_id == context.user.id,
+                )
+            )
         if dept_ids is not None:
             conditions.append(Asset.dept_id.in_(dept_ids) if dept_ids else false())
         if category_ids is not None:

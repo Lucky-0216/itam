@@ -1,6 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import BizError, ConflictError, NotFoundError
+from app.core.exceptions import BizError, ConflictError, NotFoundError, PermissionDenied
 from app.models import Dept, User
 from app.repositories.dept_repo import DeptRepository
 from app.schemas.org import DeptCreate, DeptOut, DeptUpdate
@@ -32,11 +32,13 @@ class DeptService:
         self.depts = DeptRepository(session)
         self.audit = AuditService(session)
 
-    async def tree(self, context: AuthContext) -> list[DeptOut]:
+    async def tree(self, context: AuthContext, *, source: str | None = None) -> list[DeptOut]:
         depts = await self.depts.list_all()
         allowed_ids = await scoped_dept_tree_ids(self.session, context)
         if allowed_ids is not None:
             depts = [dept for dept in depts if dept.id in allowed_ids]
+        if source is not None:
+            depts = [dept for dept in depts if dept.source == source]
         counts = await self.depts.user_counts()
 
         nodes = {
@@ -136,6 +138,8 @@ class DeptService:
             raise NotFoundError("部门不存在")
         if dept.version != payload.version:
             raise ConflictError("部门信息已被他人修改，请刷新后重试")
+        if dept.source != "local" and not context.is_superuser:
+            raise PermissionDenied("外部来源部门由同步任务维护，仅超级管理员可修改")
 
         duplicate = await self.depts.get_by_code(payload.code)
         if duplicate is not None and duplicate.id != dept.id:
@@ -202,6 +206,8 @@ class DeptService:
         dept = await self.depts.get(dept_id)
         if dept is None:
             raise NotFoundError("部门不存在")
+        if dept.source != "local" and not context.is_superuser:
+            raise PermissionDenied("外部来源部门由同步任务维护，仅超级管理员可删除")
         if await self.depts.count_children(dept.id):
             raise BizError("该部门存在下级部门，无法删除")
         if await self.depts.count_users(dept.id):

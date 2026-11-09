@@ -43,7 +43,13 @@ from app.schemas.contract import (
 )
 from app.services.audit_service import AuditService
 from app.services.permission_service import AuthContext
-from app.services.scope_service import asset_scope_conditions, scoped_dept_ids
+from app.services.scope_service import (
+    asset_domain_condition,
+    asset_scope_conditions,
+    category_domain_allowed,
+    is_self_only,
+    scoped_dept_ids,
+)
 from app.services.txn import commit_or_conflict
 
 CONTRACT_CONFLICT_MESSAGE = "合同信息已变更，请刷新后重试"
@@ -90,36 +96,74 @@ class ContractService:
         return item
 
     async def _allowed_depts(self, context: AuthContext) -> set[int] | None:
-        return await scoped_dept_ids(self.session, context)
+        return await scoped_dept_ids(self.session, context, resource="contract")
+
+    async def _target_depts(self, context: AuthContext) -> set[int] | None:
+        if is_self_only(context, "contract"):
+            return {context.user.dept_id} if context.user.dept_id else set()
+        return await self._allowed_depts(context)
 
     @staticmethod
-    def _in_scope(dept_id: int | None, allowed: set[int] | None) -> bool:
-        if allowed is None:
+    def _link_in_domain(asset: Asset | None, context: AuthContext) -> bool:
+        return asset is not None and category_domain_allowed(
+            asset.category, context, "contract"
+        )
+
+    def _contract_in_domain(
+        self, contract: AssetContract, context: AuthContext
+    ) -> bool:
+        if context.allowed_domains("contract") is None:
             return True
-        if dept_id is None:
+        links = [link for link in contract.links if link.asset is not None]
+        if not links:
             return False
-        return dept_id in allowed
+        return any(self._link_in_domain(link.asset, context) for link in links)
+
+    @classmethod
+    def _domain_conditions(cls, context: AuthContext) -> list:
+        if context.allowed_domains("contract") is None:
+            return []
+        domain_condition = asset_domain_condition(context, "contract")
+        linked_ids = (
+            select(AssetContractAsset.contract_id)
+            .join(Asset, Asset.id == AssetContractAsset.asset_id)
+            .where(domain_condition)
+        )
+        return [AssetContract.id.in_(linked_ids)]
 
     @staticmethod
-    def _view_scope(contract: AssetContract, allowed: set[int] | None) -> bool:
+    def _in_scope(
+        contract: AssetContract,
+        context: AuthContext,
+        allowed: set[int] | None,
+    ) -> bool:
+        if is_self_only(context, "contract"):
+            return context.user.id in (contract.owner_id, contract.created_by_id)
         if allowed is None:
             return True
-        if contract.dept_id is None:
-            return True
-        return contract.dept_id in allowed
+        return contract.dept_id is not None and contract.dept_id in allowed
+
+    def _view_scope(
+        self, contract: AssetContract, context: AuthContext, allowed: set[int] | None
+    ) -> bool:
+        return self._in_scope(contract, context, allowed)
 
     def _assert_view(
-        self, contract: AssetContract, allowed: set[int] | None
+        self, contract: AssetContract, context: AuthContext, allowed: set[int] | None
     ) -> None:
-        if not self._view_scope(contract, allowed):
+        if not self._view_scope(contract, context, allowed):
+            raise PermissionDenied("无权查看该合同")
+        if not self._contract_in_domain(contract, context):
             raise PermissionDenied("无权查看该合同")
 
     def _assert_manage(
-        self, contract: AssetContract, allowed: set[int] | None
+        self, contract: AssetContract, context: AuthContext, allowed: set[int] | None
     ) -> None:
         if contract.status == ContractStatus.TERMINATED:
             raise BizError("合同已终止，不能继续操作")
-        if not self._in_scope(contract.dept_id, allowed):
+        if not self._in_scope(contract, context, allowed):
+            raise PermissionDenied("无权操作该合同")
+        if not self._contract_in_domain(contract, context):
             raise PermissionDenied("无权操作该合同")
 
     def _snapshot(self, item: AssetContract) -> dict[str, object]:
@@ -149,13 +193,19 @@ class ContractService:
         days = (item.end_date - today).days
         can_manage = (
             item.status != ContractStatus.TERMINATED
-            and self._in_scope(item.dept_id, allowed)
+            and self._in_scope(item, context, allowed)
+            and self._contract_in_domain(item, context)
             and context.has_permission("asset:contract:edit")
         )
         assets: list[ContractAssetOut] = []
         for link in item.links:
             asset = link.asset
-            if asset is None:
+            if asset is None or not self._link_in_domain(asset, context):
+                continue
+            if is_self_only(context, "contract"):
+                if context.user.id not in (asset.custodian_id, asset.created_by_id):
+                    continue
+            elif allowed is not None and asset.dept_id not in allowed:
                 continue
             assets.append(
                 ContractAssetOut(
@@ -236,6 +286,11 @@ class ContractService:
                 raise BizError("合同所属部门不存在或已停用")
             if allowed is not None and payload.dept_id not in allowed:
                 raise PermissionDenied("无权在该部门下维护合同")
+        if is_self_only(context, "contract") and payload.owner_id not in (
+            None,
+            context.user.id,
+        ):
+            raise PermissionDenied("仅本人范围只能指定本人为合同负责人")
         if payload.owner_id is not None:
             owner = await session.get(User, payload.owner_id)
             if owner is None or owner.status != 1:
@@ -247,7 +302,9 @@ class ContractService:
         unique_ids = list(dict.fromkeys(asset_ids))
         if not unique_ids:
             return []
-        conditions = await asset_scope_conditions(self.session, context)
+        conditions = await asset_scope_conditions(
+            self.session, context, resource="contract"
+        )
         rows = (
             (
                 await self.session.execute(
@@ -294,7 +351,13 @@ class ContractService:
         page: int = 1,
         page_size: int = 20,
     ) -> ContractAssetOptionPage:
-        conditions = await asset_scope_conditions(self.session, context)
+        if contract_id is not None:
+            contract = await self._get_contract(contract_id)
+            allowed = await self._allowed_depts(context)
+            self._assert_view(contract, context, allowed)
+        conditions = await asset_scope_conditions(
+            self.session, context, resource="contract"
+        )
         if keyword:
             like = f"%{keyword.strip()}%"
             conditions.append(
@@ -360,7 +423,7 @@ class ContractService:
         )
 
     async def option_departments(self, context: AuthContext) -> list[dict[str, object]]:
-        allowed = await self._allowed_depts(context)
+        allowed = await self._target_depts(context)
         conditions: list = [Dept.status == 1]
         if allowed is not None:
             conditions.append(Dept.id.in_(allowed) if allowed else false())
@@ -386,8 +449,16 @@ class ContractService:
             for dept in rows
         ]
 
-    async def option_owners(self, keyword: str | None) -> list[ContractOwnerOption]:
+    async def option_owners(
+        self, context: AuthContext, keyword: str | None
+    ) -> list[ContractOwnerOption]:
         conditions: list = [User.status == 1]
+        if is_self_only(context, "contract"):
+            conditions.append(User.id == context.user.id)
+        else:
+            allowed = await self._allowed_depts(context)
+            if allowed is not None:
+                conditions.append(User.dept_id.in_(allowed) if allowed else false())
         if keyword:
             like = f"%{keyword.strip()}%"
             conditions.append(
@@ -432,7 +503,8 @@ class ContractService:
         dept_id: int | None = None,
     ) -> ContractPageOut:
         allowed = await self._allowed_depts(context)
-        conditions = self._scope_conditions(allowed)
+        conditions = self._scope_conditions(context, allowed)
+        conditions.extend(self._domain_conditions(context))
         today = now_cst().date()
         if keyword:
             like = f"%{keyword.strip()}%"
@@ -500,32 +572,38 @@ class ContractService:
         )
 
     @staticmethod
-    def _scope_conditions(allowed: set[int] | None) -> list:
+    def _scope_conditions(
+        context: AuthContext, allowed: set[int] | None
+    ) -> list:
+        if is_self_only(context, "contract"):
+            return [
+                or_(
+                    AssetContract.owner_id == context.user.id,
+                    AssetContract.created_by_id == context.user.id,
+                )
+            ]
         if allowed is None:
             return []
         if not allowed:
-            return [AssetContract.dept_id.is_(None)]
-        return [
-            or_(
-                AssetContract.dept_id.is_(None),
-                AssetContract.dept_id.in_(allowed),
-            )
-        ]
+            return [false()]
+        return [AssetContract.dept_id.in_(allowed)]
 
     async def get_contract(
         self, contract_id: int, context: AuthContext
     ) -> ContractOut:
         allowed = await self._allowed_depts(context)
         item = await self._get_contract(contract_id)
-        self._assert_view(item, allowed)
+        self._assert_view(item, context, allowed)
         return self._contract_out(item, context, allowed)
 
     async def create_contract(
         self, payload: ContractCreate, context: AuthContext
     ) -> ContractOut:
-        allowed = await self._allowed_depts(context)
+        allowed = await self._target_depts(context)
         await self._validate(self.session, payload, context, allowed)
         assets = await self._assets_for_link(payload.asset_ids, context)
+        if context.allowed_domains("contract") is not None and not assets:
+            raise BizError("受限资产域角色创建合同时必须关联至少一项授权域资产")
         item = AssetContract(
             contract_no=await self._next_no(),
             name=payload.name,
@@ -565,10 +643,10 @@ class ContractService:
     async def update_contract(
         self, contract_id: int, payload: ContractUpdate, context: AuthContext
     ) -> ContractOut:
-        allowed = await self._allowed_depts(context)
+        allowed = await self._target_depts(context)
         item = await self._get_contract(contract_id, for_update=True)
-        self._assert_view(item, allowed)
-        self._assert_manage(item, allowed)
+        self._assert_view(item, context, allowed)
+        self._assert_manage(item, context, allowed)
         if payload.version != item.version:
             raise ConflictError(CONTRACT_CONFLICT_MESSAGE, code=40911)
         await self._validate(self.session, payload, context, allowed)
@@ -608,8 +686,8 @@ class ContractService:
     ) -> ContractOut:
         allowed = await self._allowed_depts(context)
         item = await self._get_contract(contract_id, for_update=True)
-        self._assert_view(item, allowed)
-        self._assert_manage(item, allowed)
+        self._assert_view(item, context, allowed)
+        self._assert_manage(item, context, allowed)
         if payload.version != item.version:
             raise ConflictError(CONTRACT_CONFLICT_MESSAGE, code=40911)
         before = self._snapshot(item)
@@ -641,8 +719,8 @@ class ContractService:
     ) -> ContractOut:
         allowed = await self._allowed_depts(context)
         item = await self._get_contract(contract_id, for_update=True)
-        self._assert_view(item, allowed)
-        self._assert_manage(item, allowed)
+        self._assert_view(item, context, allowed)
+        self._assert_manage(item, context, allowed)
         if payload.version != item.version:
             raise ConflictError(CONTRACT_CONFLICT_MESSAGE, code=40911)
         today = now_cst().date()
@@ -685,8 +763,8 @@ class ContractService:
     ) -> ContractOut:
         allowed = await self._allowed_depts(context)
         item = await self._get_contract(contract_id, for_update=True)
-        self._assert_view(item, allowed)
-        self._assert_manage(item, allowed)
+        self._assert_view(item, context, allowed)
+        self._assert_manage(item, context, allowed)
         assets = await self._assets_for_link(payload.asset_ids, context)
         added = await self._add_links(item, assets, context)
         if added == 0:
@@ -712,8 +790,9 @@ class ContractService:
     ) -> ContractOut:
         allowed = await self._allowed_depts(context)
         item = await self._get_contract(contract_id, for_update=True)
-        self._assert_view(item, allowed)
-        self._assert_manage(item, allowed)
+        self._assert_view(item, context, allowed)
+        self._assert_manage(item, context, allowed)
+        await self._assets_for_link([asset_id], context)
         link = next((row for row in item.links if row.asset_id == asset_id), None)
         if link is None:
             raise NotFoundError("合同未关联该资产")
@@ -736,7 +815,8 @@ class ContractService:
 
     async def summary(self, context: AuthContext) -> ContractSummaryOut:
         allowed = await self._allowed_depts(context)
-        conditions = self._scope_conditions(allowed)
+        conditions = self._scope_conditions(context, allowed)
+        conditions.extend(self._domain_conditions(context))
         today = now_cst().date()
         expiring_limit = today + timedelta(days=CONTRACT_EXPIRING_DAYS)
 
@@ -772,6 +852,9 @@ class ContractService:
                 AssetContract.status == ContractStatus.ACTIVE,
             )
         )
+        asset_conditions = await asset_scope_conditions(
+            self.session, context, resource="contract"
+        )
         linked_asset_count = int(
             await self.session.scalar(
                 select(func.count(func.distinct(AssetContractAsset.asset_id)))
@@ -780,8 +863,10 @@ class ContractService:
                     AssetContract,
                     AssetContract.id == AssetContractAsset.contract_id,
                 )
+                .join(Asset, Asset.id == AssetContractAsset.asset_id)
                 .where(
                     *conditions,
+                    *asset_conditions,
                     AssetContract.status == ContractStatus.ACTIVE,
                 )
             )

@@ -10,6 +10,8 @@ celery = Celery(
     include=[
         "app.tasks.maintenance",
         "app.tasks.ldap_sync",
+        "app.tasks.dingtalk_sync",
+        "app.tasks.dingtalk_approval",
         "app.tasks.asset_flow",
         "app.tasks.contract",
         "app.tasks.reminders",
@@ -31,6 +33,14 @@ celery.conf.update(
         },
         "itam-ldap-sync": {
             "task": "app.tasks.ldap_sync.sync_due_ldap",
+            "schedule": crontab(minute="*/5"),
+        },
+        "itam-dingtalk-sync": {
+            "task": "app.tasks.dingtalk_sync.sync_due_dingtalk",
+            "schedule": crontab(minute="*/5"),
+        },
+        "itam-dingtalk-approval-reconcile": {
+            "task": "app.tasks.dingtalk_approval.reconcile_dingtalk_approvals",
             "schedule": crontab(minute="*/5"),
         },
         "itam-borrow-due-reminder": {

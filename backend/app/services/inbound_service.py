@@ -49,7 +49,11 @@ from app.services.asset_void import (
 )
 from app.services.audit_service import AuditService
 from app.services.permission_service import AuthContext
-from app.services.scope_service import scoped_dept_ids
+from app.services.scope_service import (
+    category_domain_allowed,
+    is_self_only,
+    scoped_dept_ids,
+)
 from app.services.txn import commit_or_conflict
 
 INBOUND_CONFLICT_MESSAGE = "入库单状态已变更，请刷新后重试"
@@ -345,10 +349,48 @@ class InboundService:
             raise ConflictError(CODE_CONFLICT_MESSAGE, code=40902) from exc
 
     async def _allowed_depts(self, context: AuthContext) -> set[int] | None:
-        return await scoped_dept_ids(self.session, context)
+        return await scoped_dept_ids(self.session, context, resource="inbound")
+
+    async def _target_depts(self, context: AuthContext) -> set[int] | None:
+        if is_self_only(context, "inbound"):
+            return {context.user.dept_id} if context.user.dept_id else set()
+        return await self._allowed_depts(context)
+
+    def _domain_condition(self, context: AuthContext):
+        domains = context.allowed_domains("inbound")
+        if domains is None:
+            return None
+        return AssetInbound.id.in_(
+            select(AssetInboundItem.inbound_id)
+            .join(AssetCategory, AssetCategory.id == AssetInboundItem.category_id)
+            .where(AssetCategory.asset_domain.in_(domains))
+        )
+
+    async def _assert_domain_allowed(
+        self, item: AssetInbound, context: AuthContext
+    ) -> None:
+        domains = context.allowed_domains("inbound")
+        if domains is None:
+            return
+        rows = list(
+            (
+                await self.session.execute(
+                    select(AssetCategory.asset_domain)
+                    .join(
+                        AssetInboundItem,
+                        AssetInboundItem.category_id == AssetCategory.id,
+                    )
+                    .where(AssetInboundItem.inbound_id == item.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if any(domain not in domains for domain in rows):
+            raise PermissionDenied("入库单包含无权操作的资产域")
 
     async def option_departments(self, context: AuthContext) -> list[dict[str, object]]:
-        allowed = await self._allowed_depts(context)
+        allowed = await self._target_depts(context)
         conditions: list = [Dept.status == 1]
         if allowed is not None:
             conditions.append(Dept.id.in_(allowed) if allowed else false())
@@ -374,12 +416,18 @@ class InboundService:
             for dept in rows
         ]
 
-    async def option_categories(self) -> list[dict[str, object]]:
+    async def option_categories(
+        self, context: AuthContext
+    ) -> list[dict[str, object]]:
+        conditions: list = [AssetCategory.status == 1]
+        domains = context.allowed_domains("inbound")
+        if domains is not None:
+            conditions.append(AssetCategory.asset_domain.in_(domains))
         rows = (
             (
                 await self.session.execute(
                     select(AssetCategory)
-                    .where(AssetCategory.status == 1)
+                    .where(*conditions)
                     .order_by(AssetCategory.path, AssetCategory.sort, AssetCategory.id)
                 )
             )
@@ -398,11 +446,25 @@ class InboundService:
         ]
 
     async def option_models(
-        self, category_id: int | None
+        self, context: AuthContext, category_id: int | None
     ) -> list[dict[str, object]]:
         conditions: list = [AssetModel.status == 1]
+        domains = context.allowed_domains("inbound")
         if category_id is not None:
+            category = await self.session.get(AssetCategory, category_id)
+            if category is None or not category_domain_allowed(
+                category, context, "inbound"
+            ):
+                raise PermissionDenied("无权使用该资产分类")
             conditions.append(AssetModel.category_id == category_id)
+        if domains is not None:
+            conditions.append(
+                AssetModel.category_id.in_(
+                    select(AssetCategory.id).where(
+                        AssetCategory.asset_domain.in_(domains)
+                    )
+                )
+            )
         rows = (
             (
                 await self.session.execute(
@@ -431,6 +493,27 @@ class InboundService:
     @staticmethod
     def _in_scope(dept_id: int | None, allowed: set[int] | None) -> bool:
         return allowed is None or (dept_id is not None and dept_id in allowed)
+
+    def _record_in_scope(
+        self,
+        item: AssetInbound,
+        context: AuthContext,
+        allowed: set[int] | None,
+    ) -> bool:
+        if is_self_only(context, "inbound"):
+            return item.created_by_id == context.user.id
+        return self._in_scope(item.dept_id, allowed)
+
+    async def _assert_scope(
+        self,
+        item: AssetInbound,
+        context: AuthContext,
+        *,
+        message: str = "无权操作该入库单",
+    ) -> None:
+        allowed = await self._allowed_depts(context)
+        if not self._record_in_scope(item, context, allowed):
+            raise PermissionDenied(message)
 
     async def _get_inbound(self, inbound_id: int, *, for_update: bool = False) -> AssetInbound:
         stmt = select(AssetInbound).where(AssetInbound.id == inbound_id)
@@ -518,7 +601,7 @@ class InboundService:
         code_map: dict[int, list[str]] | None = None,
         assets: list[InboundAssetOut] | None = None,
     ) -> AssetInboundOut:
-        in_scope = self._in_scope(item.dept_id, allowed)
+        in_scope = self._record_in_scope(item, context, allowed)
         can_confirm = (
             item.status == InboundStatus.PENDING
             and context.has_permission("asset:inbound:confirm")
@@ -527,10 +610,14 @@ class InboundService:
         can_cancel = item.status == InboundStatus.PENDING and in_scope and (
             item.created_by_id == context.user.id
             or context.has_permission("asset:inbound:cancel")
+            or context.has_permission("asset:inbound:delete")
         )
         can_edit = (
             item.status == InboundStatus.PENDING
-            and context.has_permission("asset:inbound:create")
+            and (
+                context.has_permission("asset:inbound:update")
+                or context.has_permission("asset:inbound:create")
+            )
             and in_scope
         )
         asset_rows = assets or []
@@ -595,8 +682,13 @@ class InboundService:
     ) -> AssetInboundPageOut:
         allowed = await self._allowed_depts(context)
         conditions: list = []
-        if allowed is not None:
+        if is_self_only(context, "inbound"):
+            conditions.append(AssetInbound.created_by_id == context.user.id)
+        elif allowed is not None:
             conditions.append(AssetInbound.dept_id.in_(allowed) if allowed else false())
+        domain_condition = self._domain_condition(context)
+        if domain_condition is not None:
+            conditions.append(domain_condition)
         if keyword:
             like = f"%{keyword.strip()}%"
             conditions.append(
@@ -641,9 +733,9 @@ class InboundService:
 
     async def get_inbound(self, inbound_id: int, context: AuthContext) -> AssetInboundOut:
         item = await self._get_inbound(inbound_id)
+        await self._assert_scope(item, context, message="无权查看该入库单")
         allowed = await self._allowed_depts(context)
-        if not self._in_scope(item.dept_id, allowed):
-            raise PermissionDenied("无权查看该入库单")
+        await self._assert_domain_allowed(item, context)
         code_maps = await self._code_lists([item.id])
         assets = await self._assets_for_inbound(item)
         return self._inbound_out(
@@ -683,6 +775,7 @@ class InboundService:
         self,
         payload: InboundCreate,
         allowed: set[int] | None,
+        context: AuthContext,
         *,
         exclude_inbound_id: int | None = None,
     ) -> tuple[
@@ -702,6 +795,10 @@ class InboundService:
         total_amount = Decimal("0")
         for index, current in enumerate(payload.items, start=1):
             category, model = await self._resolve_line(current, index)
+            if not category_domain_allowed(category, context, "inbound"):
+                raise PermissionDenied(
+                    f"第 {index} 行资产分类不在当前资产域授权范围内"
+                )
             if current.asset_nos is not None:
                 await self._assert_codes_available(
                     index,
@@ -736,17 +833,16 @@ class InboundService:
     async def create_inbound(
         self, payload: InboundCreate, context: AuthContext
     ) -> AssetInboundOut:
-        allowed = await self._allowed_depts(context)
+        allowed = await self._target_depts(context)
         dept, lines, explicit_codes, total_quantity, total_amount = (
-            await self._prepare_lines(payload, allowed)
+            await self._prepare_lines(payload, allowed, context)
         )
         source = None
         if payload.source_inbound_id is not None:
             source = await self._get_inbound(payload.source_inbound_id)
             if source.status != InboundStatus.COMPLETED:
                 raise BizError("仅已完成的入库单可以创建补录单")
-            if not self._in_scope(source.dept_id, allowed):
-                raise PermissionDenied("无权补录该入库单")
+            await self._assert_scope(source, context, message="无权补录该入库单")
             if source.dept_id != (dept.id if dept else None):
                 raise BizError("补录单的所属部门需与原入库单一致")
 
@@ -798,9 +894,9 @@ class InboundService:
         context: AuthContext,
     ) -> AssetInboundOut:
         item = await self._get_inbound(inbound_id, for_update=True)
-        allowed = await self._allowed_depts(context)
-        if not self._in_scope(item.dept_id, allowed):
-            raise PermissionDenied("无权操作该入库单")
+        await self._assert_scope(item, context)
+        allowed = await self._target_depts(context)
+        await self._assert_domain_allowed(item, context)
         if item.status != InboundStatus.PENDING:
             raise BizError("仅待确认的入库单可以修改")
         if payload.version != item.version:
@@ -830,7 +926,7 @@ class InboundService:
 
         dept, lines, explicit_codes, total_quantity, total_amount = (
             await self._prepare_lines(
-                payload, allowed, exclude_inbound_id=item.id
+                payload, allowed, context, exclude_inbound_id=item.id
             )
         )
         item.inbound_type = payload.inbound_type
@@ -873,9 +969,9 @@ class InboundService:
         context: AuthContext,
     ) -> AssetInboundOut:
         item = await self._get_inbound(inbound_id, for_update=True)
+        await self._assert_scope(item, context)
         allowed = await self._allowed_depts(context)
-        if not self._in_scope(item.dept_id, allowed):
-            raise PermissionDenied("无权操作该入库单")
+        await self._assert_domain_allowed(item, context)
         if item.status != InboundStatus.COMPLETED:
             raise BizError("仅已确认的入库单可以冲销")
         if payload.version != item.version:
@@ -995,9 +1091,9 @@ class InboundService:
         context: AuthContext,
     ) -> AssetInboundOut:
         item = await self._get_inbound(inbound_id, for_update=True)
+        await self._assert_scope(item, context)
         allowed = await self._allowed_depts(context)
-        if not self._in_scope(item.dept_id, allowed):
-            raise PermissionDenied("无权操作该入库单")
+        await self._assert_domain_allowed(item, context)
         if item.status != InboundStatus.PENDING:
             raise BizError("当前入库单不在待确认状态")
         if payload.version != item.version:
@@ -1092,6 +1188,9 @@ class InboundService:
                         status=AssetStatus.PENDING_STOCK,
                         custom_fields=None,
                         remark=line.remark or item.remark,
+                        created_by_id=item.created_by_id or context.user.id,
+                        created_by_name=item.created_by_name
+                        or _user_name(context.user),
                     )
                     self.session.add(asset)
                     await self.session.flush()
@@ -1154,14 +1253,15 @@ class InboundService:
         context: AuthContext,
     ) -> AssetInboundOut:
         item = await self._get_inbound(inbound_id)
+        await self._assert_scope(item, context)
         allowed = await self._allowed_depts(context)
-        if not self._in_scope(item.dept_id, allowed):
-            raise PermissionDenied("无权操作该入库单")
+        await self._assert_domain_allowed(item, context)
         if item.status != InboundStatus.PENDING:
             raise BizError("仅待确认的入库单可以取消")
         if (
             item.created_by_id != context.user.id
             and not context.has_permission("asset:inbound:cancel")
+            and not context.has_permission("asset:inbound:delete")
         ):
             raise PermissionDenied("无权取消该入库单")
         item.status = InboundStatus.CANCELLED

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { isAxiosError } from 'axios'
 import {
   ElMessage,
   ElMessageBox,
@@ -25,7 +26,9 @@ import { useAuthStore } from '@/stores/auth'
 import type { DeptNode } from '@/types/org'
 import type {
   AdminMenuNode,
+  DomainScope,
   FieldPermissionItem,
+  ResourceDataPermissionItem,
   RoleDetail,
   RoleItem,
   RoleMeta,
@@ -64,6 +67,42 @@ const fallbackScopes = [
 
 const scopeOptions = computed(() => roleMeta.value?.data_scopes ?? fallbackScopes)
 const fieldCatalog = computed(() => roleMeta.value?.field_catalog ?? {})
+const resourceOptions = computed(() => roleMeta.value?.data_resources ?? [])
+const assetDomainOptions = computed(() => roleMeta.value?.asset_domains ?? [])
+
+interface ResourceScopeState {
+  enabled: boolean
+  data_scope: string
+  dept_ids: number[]
+}
+
+const resourceState = ref<Record<string, ResourceScopeState>>({})
+
+const resourceRows = computed(() =>
+  resourceOptions.value.map((option) => ({
+    value: option.value,
+    label: option.label,
+    enabled: resourceState.value[option.value]?.enabled ?? false,
+    data_scope: resourceState.value[option.value]?.data_scope ?? selectedScope.value,
+    dept_ids: resourceState.value[option.value]?.dept_ids ?? [],
+  })),
+)
+
+const showDeptTree = computed(() => selectedScope.value === 'CUSTOM')
+const deptTreeSelectProps = { label: 'name', children: 'children', value: 'id' }
+const noDomainWarning = computed(
+  () => selectedDomainScope.value === 'CUSTOM' && !selectedAssetDomains.value.length,
+)
+
+function domainLabel(code: string): string {
+  return assetDomainOptions.value.find((item) => item.value === code)?.label ?? code
+}
+
+function roleDomainText(row: RoleItem): string {
+  if (row.domain_scope === 'ALL') return '全部资产域'
+  if (!row.asset_domains.length) return '无资产域权限'
+  return row.asset_domains.map(domainLabel).join('、')
+}
 
 const SCOPE_DESCRIPTIONS: Record<string, string> = {
   ALL: '可查看系统内全部部门数据',
@@ -133,6 +172,8 @@ interface RoleFormState {
   name: string
   description: string
   data_scope: string
+  domain_scope: DomainScope
+  asset_domains: string[]
   sort: number
   status: number
   version: number
@@ -144,6 +185,8 @@ const roleForm = reactive<RoleFormState>({
   name: '',
   description: '',
   data_scope: 'SELF',
+  domain_scope: 'CUSTOM',
+  asset_domains: [],
   sort: 0,
   status: 1,
   version: 1,
@@ -171,6 +214,8 @@ function resetRoleForm(): void {
     name: '',
     description: '',
     data_scope: 'SELF',
+    domain_scope: 'CUSTOM',
+    asset_domains: [],
     sort: 0,
     status: 1,
     version: 1,
@@ -197,6 +242,8 @@ function openEditRole(row: RoleItem): void {
     name: row.name,
     description: row.description ?? '',
     data_scope: row.data_scope,
+    domain_scope: row.domain_scope,
+    asset_domains: [...row.asset_domains],
     sort: row.sort,
     status: row.status,
     version: row.version,
@@ -208,6 +255,12 @@ function openEditRole(row: RoleItem): void {
 async function submitRole(): Promise<void> {
   const valid = await roleFormRef.value?.validate().catch(() => false)
   if (!valid || roleSubmitting.value) return
+  if (roleDialogMode.value === 'create' && !auth.isSuperAdmin) {
+    if (roleForm.data_scope === 'ALL' || roleForm.domain_scope === 'ALL') {
+      ElMessage.warning('只有超级管理员可以授予全部数据范围或全部资产域')
+      return
+    }
+  }
   roleSubmitting.value = true
   try {
     if (roleDialogMode.value === 'create') {
@@ -216,6 +269,9 @@ async function submitRole(): Promise<void> {
         name: roleForm.name.trim(),
         description: roleForm.description.trim() || null,
         data_scope: roleForm.data_scope,
+        domain_scope: roleForm.domain_scope,
+        asset_domains:
+          roleForm.domain_scope === 'ALL' ? [] : [...roleForm.asset_domains],
         sort: roleForm.sort,
         status: roleForm.status,
       })
@@ -261,6 +317,9 @@ const saving = ref(false)
 const menuTreeRef = ref<InstanceType<typeof ElTree>>()
 const dataTreeRef = ref<InstanceType<typeof ElTree>>()
 const selectedScope = ref('SELF')
+// 角色级资产域：ALL=显式全部域（仅超管可授予）；CUSTOM+空数组=无资产域权限。
+const selectedDomainScope = ref<DomainScope>('CUSTOM')
+const selectedAssetDomains = ref<string[]>([])
 const fieldState = ref<Record<string, Record<string, { can_view: boolean; can_edit: boolean }>>>({})
 const memberIds = ref<number[]>([])
 const memberOptions = ref<RoleUserOption[]>([])
@@ -295,7 +354,13 @@ const canSaveCurrent = computed(() => {
   if (activeTab.value === 'menu') return canEditMenus.value
   if (activeTab.value === 'data') {
     if (!canEditData.value) return false
-    if (selectedScope.value === 'ALL' && !auth.isSuperAdmin) return false
+    if (!auth.isSuperAdmin) {
+      if (selectedScope.value === 'ALL') return false
+      if (selectedDomainScope.value === 'ALL') return false
+      if (resourceRows.value.some((row) => row.enabled && row.data_scope === 'ALL')) {
+        return false
+      }
+    }
     return true
   }
   if (activeTab.value === 'field') return canEditFields.value
@@ -378,9 +443,56 @@ function mergeMemberOptions(detail: RoleDetail): void {
   memberIds.value = detail.users.map((user) => user.id)
 }
 
+function buildResourceState(detail: RoleDetail): Record<string, ResourceScopeState> {
+  const result: Record<string, ResourceScopeState> = {}
+  for (const option of resourceOptions.value) {
+    result[option.value] = {
+      enabled: false,
+      data_scope: detail.data_scope,
+      dept_ids: [],
+    }
+  }
+  for (const item of detail.data_permissions ?? []) {
+    result[item.resource] = {
+      enabled: true,
+      data_scope: item.data_scope,
+      dept_ids: [...(item.dept_ids ?? [])],
+    }
+  }
+  return result
+}
+
+function setResourceEnabled(
+  resource: string,
+  value: string | number | boolean,
+): void {
+  if (!canEditData.value) return
+  const state = resourceState.value[resource]
+  if (!state) return
+  state.enabled = Boolean(value)
+  if (state.enabled && !state.data_scope) state.data_scope = selectedScope.value
+}
+
+function setResourceScope(resource: string, value: string): void {
+  if (!canEditData.value) return
+  const state = resourceState.value[resource]
+  if (!state) return
+  state.data_scope = value
+  if (value !== 'CUSTOM') state.dept_ids = []
+}
+
+function setResourceDepts(resource: string, value: number[]): void {
+  if (!canEditData.value) return
+  const state = resourceState.value[resource]
+  if (state) state.dept_ids = value.map(Number).filter((id) => Number.isFinite(id))
+}
+
 async function hydrateEditor(detail: RoleDetail): Promise<void> {
   selectedScope.value = detail.data_scope
+  selectedDomainScope.value = detail.domain_scope
+  selectedAssetDomains.value = [...detail.asset_domains]
   fieldState.value = buildFieldState(detail)
+  resourceState.value = buildResourceState(detail)
   mergeMemberOptions(detail)
   pendingMenuHydration.value = true
   pendingDataHydration.value = true
@@ -510,18 +622,30 @@ function checkedDeptIds(): number[] {
 
 async function saveCurrent(): Promise<void> {
   if (!currentRole.value || !canSaveCurrent.value || saving.value) return
-  let deptIds: number[] = []
-  if (activeTab.value === 'data' && selectedScope.value === 'CUSTOM') {
-    deptIds = checkedDeptIds()
-    if (!deptIds.length) {
+  const roleId = currentRole.value.id
+  const version = currentRole.value.version
+  const deptIds = activeTab.value === 'data' && showDeptTree.value ? checkedDeptIds() : []
+  const permissions: ResourceDataPermissionItem[] = []
+  if (activeTab.value === 'data') {
+    if (showDeptTree.value && !deptIds.length) {
       ElMessage.warning('自定义数据范围至少需要勾选一个部门')
       return
+    }
+    for (const row of resourceRows.value) {
+      if (!row.enabled) continue
+      if (row.data_scope === 'CUSTOM' && !row.dept_ids.length) {
+        ElMessage.warning(`「${row.label}」使用自定义部门时至少需要选择一个部门`)
+        return
+      }
+      permissions.push({
+        resource: row.value,
+        data_scope: row.data_scope,
+        dept_ids: row.data_scope === 'CUSTOM' ? [...row.dept_ids] : [],
+      })
     }
   }
   saving.value = true
   try {
-    const roleId = currentRole.value.id
-    const version = currentRole.value.version
     let detail: RoleDetail
     if (activeTab.value === 'menu') {
       const keys = (menuTreeRef.value?.getCheckedKeys(false) ?? []) as Array<string | number>
@@ -530,17 +654,21 @@ async function saveCurrent(): Promise<void> {
         version,
       })
     } else if (activeTab.value === 'data') {
-      detail = await roleApi.assignDataScope(roleId, {
+      detail = await roleApi.assignDataPermissions(roleId, {
         data_scope: selectedScope.value,
-        dept_ids: selectedScope.value === 'CUSTOM' ? deptIds : [],
+        domain_scope: selectedDomainScope.value,
+        asset_domains:
+          selectedDomainScope.value === 'ALL' ? [] : [...selectedAssetDomains.value],
+        permissions,
+        dept_ids: deptIds,
         version,
       })
     } else if (activeTab.value === 'field') {
-      const permissions: FieldPermissionItem[] = []
+      const fieldItems: FieldPermissionItem[] = []
       for (const [resource, fields] of Object.entries(fieldState.value)) {
         for (const [field, state] of Object.entries(fields)) {
           if (!state.can_view || !state.can_edit) {
-            permissions.push({
+            fieldItems.push({
               resource,
               field,
               can_view: state.can_view,
@@ -549,7 +677,10 @@ async function saveCurrent(): Promise<void> {
           }
         }
       }
-      detail = await roleApi.assignFieldPermissions(roleId, { permissions, version })
+      detail = await roleApi.assignFieldPermissions(roleId, {
+        permissions: fieldItems,
+        version,
+      })
     } else {
       detail = await roleApi.assignUsers(roleId, { user_ids: memberIds.value, version })
     }
@@ -557,6 +688,16 @@ async function saveCurrent(): Promise<void> {
     await hydrateEditor(detail)
     ElMessage.success('权限配置已保存')
     await loadRoles()
+  } catch (error) {
+    // 版本冲突后必须重新取详情，否则后续保存会一直带着过期 version。
+    if (isAxiosError(error) && error.response?.status === 409) {
+      const latest = await roleApi.getRole(roleId).catch(() => null)
+      if (latest) {
+        currentRole.value = latest
+        await hydrateEditor(latest)
+        ElMessage.info('已加载他人保存的最新配置，请确认后重新保存')
+      }
+    }
   } finally {
     saving.value = false
   }
@@ -574,7 +715,7 @@ onMounted(() => {
         <p class="page-eyebrow">ROLE BASED ACCESS CONTROL</p>
         <h1 class="page-title">角色与授权</h1>
         <p class="page-subtitle">
-          角色承载菜单、按钮、数据范围与字段四级权限；所有授权在后端二次校验并写入审计日志。
+          角色按资产域、数据范围、菜单与操作码授权；资产域一次配置后自动作用于全部资产业务。
         </p>
       </div>
       <div class="page-actions">
@@ -665,6 +806,14 @@ onMounted(() => {
             >
               {{ row.data_scope_label }}
             </el-tag>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="资产域" min-width="160" show-overflow-tooltip>
+          <template #default="{ row }">
+            <span :class="{ muted: row.domain_scope !== 'ALL' && !row.asset_domains.length }">
+              {{ roleDomainText(row) }}
+            </span>
           </template>
         </el-table-column>
 
@@ -814,6 +963,50 @@ onMounted(() => {
               <span>数据范围请在「授权 → 数据权限」中调整</span>
             </div>
           </el-form-item>
+          <el-form-item v-if="roleDialogMode === 'create'" label="可管理资产域" class="span-2">
+            <div class="domain-form-block">
+              <el-radio-group v-model="roleForm.domain_scope">
+                <el-radio value="ALL" :disabled="!auth.isSuperAdmin">全部资产域</el-radio>
+                <el-radio value="CUSTOM">指定资产域</el-radio>
+              </el-radio-group>
+              <el-select
+                v-if="roleForm.domain_scope === 'CUSTOM'"
+                v-model="roleForm.asset_domains"
+                multiple
+                collapse-tags
+                collapse-tags-tooltip
+                placeholder="未选择表示无资产域权限"
+                class="domain-form-select"
+              >
+                <el-option
+                  v-for="domain in assetDomainOptions"
+                  :key="domain.value"
+                  :label="domain.label"
+                  :value="domain.value"
+                />
+              </el-select>
+              <el-alert
+                v-if="roleForm.domain_scope === 'CUSTOM' && !roleForm.asset_domains.length"
+                title="未选择任何资产域时，该角色不能访问资产数据"
+                type="warning"
+                :closable="false"
+                show-icon
+              />
+              <p class="tab-hint">一次配置，自动作用于台账、入库、领用、调拨、报废、盘点、维修、合同与报表。</p>
+            </div>
+          </el-form-item>
+          <el-form-item v-else label="可管理资产域" class="span-2">
+            <div class="readonly-field">
+              <el-tag effect="light" round>
+                {{ roleForm.domain_scope === 'ALL'
+                  ? '全部资产域'
+                  : roleForm.asset_domains.length
+                    ? roleForm.asset_domains.map(domainLabel).join('、')
+                    : '无资产域权限' }}
+              </el-tag>
+              <span>资产域请在「授权 → 数据权限」中调整</span>
+            </div>
+          </el-form-item>
           <el-form-item label="说明" class="span-2">
             <el-input
               v-model="roleForm.description"
@@ -952,9 +1145,48 @@ onMounted(() => {
                 超级管理员固定为「全部数据」范围。
               </div>
               <template v-else>
+                <div class="domain-scope-block">
+                  <div class="subhead">
+                    <strong>可管理资产域</strong>
+                    <span>角色级配置，自动作用于全部资产业务；无需按资源重复勾选。</span>
+                  </div>
+                  <el-radio-group v-model="selectedDomainScope" :disabled="!canEditData">
+                    <el-radio value="ALL" :disabled="!auth.isSuperAdmin">全部资产域</el-radio>
+                    <el-radio value="CUSTOM">指定资产域</el-radio>
+                  </el-radio-group>
+                  <el-select
+                    v-if="selectedDomainScope === 'CUSTOM'"
+                    v-model="selectedAssetDomains"
+                    multiple
+                    collapse-tags
+                    collapse-tags-tooltip
+                    :disabled="!canEditData"
+                    class="domain-select"
+                    placeholder="未选择表示无资产域权限"
+                  >
+                    <el-option
+                      v-for="domain in assetDomainOptions"
+                      :key="domain.value"
+                      :label="domain.label"
+                      :value="domain.value"
+                    />
+                  </el-select>
+                  <el-alert
+                    v-if="noDomainWarning"
+                    title="当前未授予任何资产域，该角色不能访问资产数据"
+                    type="warning"
+                    :closable="false"
+                    show-icon
+                    class="drawer-alert"
+                  />
+                  <p class="tab-hint">
+                    多个角色的指定资产域取并集；只有显式「全部资产域」才表示不限域。
+                  </p>
+                </div>
+
                 <div class="tab-toolbar">
                   <div class="toolbar-copy">
-                    <strong>数据范围</strong>
+                    <strong>默认数据范围</strong>
                     <span>后端查询层会按所选范围强制过滤，前端不作为最终保障。</span>
                   </div>
                 </div>
@@ -972,7 +1204,7 @@ onMounted(() => {
                   </el-radio>
                 </el-radio-group>
 
-                <div v-if="selectedScope === 'CUSTOM'" class="dept-scope-block">
+                <div v-if="showDeptTree" class="dept-scope-block">
                   <div class="subhead">
                     <strong>自定义部门</strong>
                     <span>仅包含勾选部门，不自动包含下级；需要下级请一并勾选。</span>
@@ -997,10 +1229,78 @@ onMounted(() => {
                       empty-text="暂无部门数据"
                     />
                   </div>
+                  <p class="tab-hint dept-scope-hint">
+                    此处勾选仅作用于角色默认范围；下方资源开启单独配置后可各自选择部门。
+                  </p>
                 </div>
-                <p v-else class="tab-hint">
-                  切换数据范围后保存即可生效；角色成员需刷新前端权限才能看到新菜单。
-                </p>
+
+                <div class="resource-scope-block">
+                  <div class="subhead">
+                    <strong>资源数据权限</strong>
+                    <span>
+                      未开启单独配置的资源沿用上方角色默认范围；开启后可为该资源单独指定部门范围。
+                    </span>
+                  </div>
+                  <el-table :data="resourceRows" size="small" border class="resource-table">
+                    <el-table-column label="资源" prop="label" width="130" />
+                    <el-table-column label="单独配置" width="92" align="center">
+                      <template #default="{ row }">
+                        <el-switch
+                          :model-value="row.enabled"
+                          :disabled="!canEditData"
+                          @change="setResourceEnabled(row.value, $event)"
+                        />
+                      </template>
+                    </el-table-column>
+                    <el-table-column label="数据范围" min-width="150">
+                      <template #default="{ row }">
+                        <el-select
+                          :model-value="row.data_scope"
+                          :disabled="!canEditData || !row.enabled"
+                          size="small"
+                          class="cell-select"
+                          @change="setResourceScope(row.value, $event)"
+                        >
+                          <el-option
+                            v-for="scope in scopeOptions"
+                            :key="scope.value"
+                            :label="scope.label"
+                            :value="scope.value"
+                            :disabled="scope.value === 'ALL' && !auth.isSuperAdmin"
+                          />
+                        </el-select>
+                      </template>
+                    </el-table-column>
+                    <el-table-column label="自定义部门" min-width="220">
+                      <template #default="{ row }">
+                        <el-tree-select
+                          v-if="row.enabled && row.data_scope === 'CUSTOM'"
+                          :model-value="row.dept_ids"
+                          :data="deptTreeData"
+                          :props="deptTreeSelectProps"
+                          node-key="id"
+                          multiple
+                          show-checkbox
+                          check-strictly
+                          collapse-tags
+                          collapse-tags-tooltip
+                          :render-after-expand="false"
+                          :disabled="!canEditData || Boolean(deptTreeError)"
+                          size="small"
+                          class="cell-select"
+                          placeholder="选择部门"
+                          @change="setResourceDepts(row.value, $event)"
+                        />
+                        <span v-else class="muted">
+                          {{ row.enabled ? '沿用所选范围' : '未单独配置' }}
+                        </span>
+                      </template>
+                    </el-table-column>
+                  </el-table>
+                  <p class="tab-hint">
+                    多个角色之间数据范围取最宽；「仅本人」在所有资源统一表示只看本人创建、持有或申请的数据。
+                  </p>
+                </div>
               </template>
             </el-tab-pane>
 
@@ -1560,6 +1860,12 @@ onMounted(() => {
   line-height: 1.5;
 }
 
+.domain-scope-block {
+  margin-bottom: 16px;
+  padding-bottom: 14px;
+  border-bottom: 1px dashed var(--border);
+}
+
 .dept-scope-block {
   margin-top: 16px;
   padding-top: 14px;
@@ -1587,6 +1893,46 @@ onMounted(() => {
 
 .dept-scope-tree {
   max-height: 280px;
+}
+
+.dept-scope-hint {
+  margin-top: 8px;
+}
+
+.domain-select {
+  width: 100%;
+  margin-top: 10px;
+}
+
+.domain-form-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+}
+
+.domain-form-select {
+  width: 100%;
+  margin-top: 8px;
+}
+
+.resource-scope-block {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--border);
+}
+
+.resource-table {
+  width: 100%;
+  border-radius: 12px;
+}
+
+.resource-table :deep(.el-table__cell) {
+  padding: 7px 0;
+}
+
+.cell-select {
+  width: 100%;
 }
 
 .field-group {

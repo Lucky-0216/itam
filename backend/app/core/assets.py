@@ -50,6 +50,19 @@ CATEGORY_TYPE_LABELS = {
 }
 
 
+class AssetDomain:
+    """资产业务域：分类树顶级节点绑定，子分类继承。"""
+
+    IT = "IT"
+    ADMIN = "ADMIN"
+
+
+ASSET_DOMAIN_LABELS = {
+    AssetDomain.IT: "IT 资产",
+    AssetDomain.ADMIN: "行政资产",
+}
+
+
 class FieldType:
     TEXT = "TEXT"
     NUMBER = "NUMBER"

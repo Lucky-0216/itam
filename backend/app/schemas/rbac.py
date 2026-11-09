@@ -3,7 +3,13 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field, field_validator
 
-from app.core.permissions import DATA_SCOPE_LABELS, FIELD_CATALOG, DataScope
+from app.core.permissions import (
+    DATA_RESOURCE_LABELS,
+    DATA_SCOPE_LABELS,
+    FIELD_CATALOG,
+    DataScope,
+    DomainScope,
+)
 
 _ROLE_CODE_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,49}$")
 _RESOURCE_FIELDS = {
@@ -17,6 +23,8 @@ class RoleCreate(BaseModel):
     name: str = Field(min_length=1, max_length=50)
     description: str | None = Field(default=None, max_length=255)
     data_scope: str = Field(default=DataScope.SELF)
+    domain_scope: str = Field(default=DomainScope.CUSTOM)
+    asset_domains: list[str] = Field(default_factory=list)
     sort: int = Field(default=0, ge=0, le=9999)
     status: int = Field(default=1, ge=0, le=1)
 
@@ -38,9 +46,21 @@ class RoleCreate(BaseModel):
     @field_validator("data_scope")
     @classmethod
     def check_scope(cls, value: str) -> str:
-        if value not in DATA_SCOPE_LABELS:
+        if value not in DATA_SCOPE_LABELS or value == DataScope.ROLE:
             raise ValueError("数据范围不合法")
         return value
+
+    @field_validator("domain_scope")
+    @classmethod
+    def check_domain_scope(cls, value: str) -> str:
+        if value not in (DomainScope.ALL, DomainScope.CUSTOM):
+            raise ValueError("资产域范围不合法")
+        return value
+
+    @field_validator("asset_domains")
+    @classmethod
+    def dedupe_domains(cls, value: list[str]) -> list[str]:
+        return sorted(set(value))
 
 
 class RoleUpdate(BaseModel):
@@ -65,6 +85,8 @@ class RoleOut(BaseModel):
     description: str | None = None
     data_scope: str
     data_scope_label: str
+    domain_scope: str
+    asset_domains: list[str] = Field(default_factory=list)
     status: int
     sort: int
     is_system: bool
@@ -117,6 +139,7 @@ class RoleDetailOut(RoleOut):
     menu_ids: list[int] = Field(default_factory=list)
     dept_ids: list[int] = Field(default_factory=list)
     field_permissions: list[FieldPermissionItem] = Field(default_factory=list)
+    data_permissions: list["ResourceDataPermissionItem"] = Field(default_factory=list)
     users: list[RoleMemberOut] = Field(default_factory=list)
 
 
@@ -130,27 +153,6 @@ class MenuAssignRequest(BaseModel):
         result = list(dict.fromkeys(value))
         if any(item <= 0 for item in result):
             raise ValueError("菜单 ID 不合法")
-        return result
-
-
-class DataScopeAssignRequest(BaseModel):
-    data_scope: str
-    dept_ids: list[int] = Field(default_factory=list)
-    version: int = Field(ge=1)
-
-    @field_validator("data_scope")
-    @classmethod
-    def check_scope(cls, value: str) -> str:
-        if value not in DATA_SCOPE_LABELS:
-            raise ValueError("数据范围不合法")
-        return value
-
-    @field_validator("dept_ids")
-    @classmethod
-    def dedupe(cls, value: list[int]) -> list[int]:
-        result = list(dict.fromkeys(value))
-        if any(item <= 0 for item in result):
-            raise ValueError("部门 ID 不合法")
         return result
 
 
@@ -168,6 +170,82 @@ class FieldPermissionsAssignRequest(BaseModel):
                 raise ValueError("字段权限存在重复项")
             seen.add(key)
         return value
+
+
+class ResourceDataPermissionItem(BaseModel):
+    resource: str = Field(min_length=1, max_length=50)
+    data_scope: str = Field(default=DataScope.SELF)
+    dept_ids: list[int] = Field(default_factory=list)
+
+    @field_validator("resource")
+    @classmethod
+    def check_resource(cls, value: str) -> str:
+        if value not in DATA_RESOURCE_LABELS:
+            raise ValueError("数据资源不合法")
+        return value
+
+    @field_validator("data_scope")
+    @classmethod
+    def check_scope(cls, value: str) -> str:
+        if value not in DATA_SCOPE_LABELS or value == DataScope.ROLE:
+            raise ValueError("数据范围不合法")
+        return value
+
+    @field_validator("dept_ids")
+    @classmethod
+    def dedupe_dept_ids(cls, value: list[int]) -> list[int]:
+        result = sorted(set(value))
+        if any(item <= 0 for item in result):
+            raise ValueError("部门 ID 不合法")
+        return result
+
+
+class DataPermissionsAssignRequest(BaseModel):
+    data_scope: str
+    domain_scope: str
+    asset_domains: list[str] = Field(default_factory=list)
+    permissions: list[ResourceDataPermissionItem] = Field(default_factory=list)
+    dept_ids: list[int] = Field(default_factory=list)
+    version: int = Field(ge=1)
+
+    @field_validator("data_scope")
+    @classmethod
+    def check_global_scope(cls, value: str) -> str:
+        if value not in DATA_SCOPE_LABELS or value == DataScope.ROLE:
+            raise ValueError("数据范围不合法")
+        return value
+
+    @field_validator("domain_scope")
+    @classmethod
+    def check_domain_scope(cls, value: str) -> str:
+        if value not in (DomainScope.ALL, DomainScope.CUSTOM):
+            raise ValueError("资产域范围不合法")
+        return value
+
+    @field_validator("asset_domains")
+    @classmethod
+    def dedupe_domains(cls, value: list[str]) -> list[str]:
+        return sorted(set(value))
+
+    @field_validator("permissions")
+    @classmethod
+    def dedupe(
+        cls, value: list[ResourceDataPermissionItem]
+    ) -> list[ResourceDataPermissionItem]:
+        seen: set[str] = set()
+        for item in value:
+            if item.resource in seen:
+                raise ValueError("同一资源只能配置一条数据权限")
+            seen.add(item.resource)
+        return value
+
+    @field_validator("dept_ids")
+    @classmethod
+    def dedupe_depts(cls, value: list[int]) -> list[int]:
+        result = list(dict.fromkeys(value))
+        if any(item <= 0 for item in result):
+            raise ValueError("部门 ID 不合法")
+        return result
 
 
 class RoleUsersAssignRequest(BaseModel):
@@ -206,6 +284,16 @@ class DataScopeOption(BaseModel):
     label: str
 
 
+class ResourceOption(BaseModel):
+    value: str
+    label: str
+
+
 class RoleMetaOut(BaseModel):
     data_scopes: list[DataScopeOption]
     field_catalog: dict[str, list[dict[str, str]]]
+    data_resources: list[ResourceOption] = Field(default_factory=list)
+    asset_domains: list[DataScopeOption] = Field(default_factory=list)
+
+
+RoleDetailOut.model_rebuild()

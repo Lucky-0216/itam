@@ -26,8 +26,27 @@ import {
   REQUEST_STATUS_LABELS,
   REQUEST_STATUS_TAG_TYPES,
   REQUEST_TYPE_LABELS,
+  type TagType,
 } from '@/types/assetFlow'
 import { formatDateTime } from '@/utils/format'
+
+const DINGTALK_STATUS_META: Record<
+  NonNullable<AssetRequestItem['dingtalk_status']>,
+  { label: string; type: TagType }
+> = {
+  RUNNING: { label: '钉钉审批中', type: 'warning' },
+  APPROVED: { label: '钉钉已通过', type: 'success' },
+  REJECTED: { label: '钉钉已驳回', type: 'danger' },
+  TERMINATED: { label: '钉钉已撤销', type: 'info' },
+}
+
+function dingtalkMeta(
+  status: AssetRequestItem['dingtalk_status'],
+): { label: string; type: TagType } {
+  return status && DINGTALK_STATUS_META[status]
+    ? DINGTALK_STATUS_META[status]
+    : { label: '钉钉审批', type: 'info' }
+}
 
 interface CreateForm {
   request_type: AssetRequestType
@@ -471,8 +490,13 @@ onMounted(async () => {
           <template #default="{ row }">
             <div class="stack-cell">
               <span>{{ approvalProgress(row) }}</span>
+              <small v-if="row.dingtalk_instance_id" class="dingtalk-line">
+                <el-tag size="small" :type="dingtalkMeta(row.dingtalk_status).type" effect="plain">
+                  {{ dingtalkMeta(row.dingtalk_status).label }}
+                </el-tag>
+              </small>
               <small
-                v-if="
+                v-else-if="
                   row.status === 'PENDING_APPROVAL' &&
                   row.flow_id &&
                   row.current_approvers.length
@@ -798,6 +822,11 @@ onMounted(async () => {
 .stack-cell small {
   color: var(--text-3);
   font-size: 11.5px;
+}
+
+.dingtalk-line {
+  display: inline-flex;
+  align-items: center;
 }
 
 .pending-text {

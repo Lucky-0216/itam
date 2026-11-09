@@ -5,7 +5,7 @@ from app.api.deps import require_any_perm, require_perm
 from app.core.database import get_db
 from app.core.response import ok
 from app.schemas.rbac import (
-    DataScopeAssignRequest,
+    DataPermissionsAssignRequest,
     FieldPermissionsAssignRequest,
     MenuAssignRequest,
     RoleCreate,
@@ -61,9 +61,11 @@ async def role_options(
 
 @router.get("/roles/options/meta", summary="数据范围与字段权限目录")
 async def role_meta(
-    _: AuthContext = Depends(require_perm("system:role:view")),
+    context: AuthContext = Depends(require_perm("system:role:view")),
+    session: AsyncSession = Depends(get_db),
 ):
-    return ok(RoleService.meta().model_dump(mode="json"))
+    result = await RoleService(session).meta(context)
+    return ok(result.model_dump(mode="json"))
 
 
 @router.get("/roles/menu-tree", summary="全量菜单树（含按钮）")
@@ -139,15 +141,15 @@ async def assign_role_menus(
     return ok(result.model_dump(mode="json"), message="菜单权限已保存")
 
 
-@router.put("/roles/{role_id}/data-scope", summary="分配数据权限")
-async def assign_role_data_scope(
+@router.put("/roles/{role_id}/data-permissions", summary="分配数据范围、资产域与资源数据权限")
+async def assign_role_data_permissions(
     role_id: int,
-    payload: DataScopeAssignRequest,
+    payload: DataPermissionsAssignRequest,
     context: AuthContext = Depends(require_perm("system:role:assign-data")),
     session: AsyncSession = Depends(get_db),
 ):
-    result = await RoleService(session).assign_data_scope(role_id, payload, context)
-    return ok(result.model_dump(mode="json"), message="数据权限已保存")
+    result = await RoleService(session).assign_data_permissions(role_id, payload, context)
+    return ok(result.model_dump(mode="json"), message="资源数据权限已保存")
 
 
 @router.put("/roles/{role_id}/field-permissions", summary="分配字段权限")

@@ -37,6 +37,7 @@ from app.services.audit_service import AuditService
 from app.services.permission_service import AuthContext
 from app.services.scope_service import (
     asset_scope_conditions,
+    category_domain_allowed,
     is_self_only,
     scoped_dept_ids,
 )
@@ -82,7 +83,9 @@ class ReportService:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
-    async def _category_ids(self, category_id: int, include_child: bool) -> list[int]:
+    async def _category_ids(
+        self, context: AuthContext, category_id: int, include_child: bool
+    ) -> list[int]:
         categories = list(
             (await self.session.execute(select(AssetCategory))).scalars().all()
         )
@@ -90,7 +93,9 @@ class ReportService:
             (item for item in categories if item.id == category_id),
             None,
         )
-        if selected is None:
+        if selected is None or not category_domain_allowed(
+            selected, context, "report"
+        ):
             raise NotFoundError("资产分类不存在")
         if not include_child:
             return [selected.id]
@@ -118,23 +123,27 @@ class ReportService:
         apply_status: bool = True,
     ) -> list[Any]:
         self._validate_filters(filters)
-        conditions = await asset_scope_conditions(self.session, context)
+        conditions = await asset_scope_conditions(
+            self.session, context, resource="report"
+        )
         if filters.keyword:
             like = f"%{filters.keyword.strip()}%"
-            conditions.append(
-                or_(
-                    Asset.asset_no.like(like),
-                    Asset.name.like(like),
-                    Asset.serial_no.like(like),
-                    Asset.supplier.like(like),
-                    Asset.location.like(like),
-                )
-            )
+            matchers = [Asset.asset_no.like(like)]
+            # 不可见字段不能参与筛选，否则可用关键字逐位推断被遮蔽的内容。
+            for field_name, column in (
+                ("name", Asset.name),
+                ("serial_no", Asset.serial_no),
+                ("supplier", Asset.supplier),
+                ("location", Asset.location),
+            ):
+                if context.can_view_field("asset", field_name):
+                    matchers.append(column.like(like))
+            conditions.append(or_(*matchers))
         if apply_status and filters.status:
             conditions.append(Asset.status == filters.status)
         if filters.category_id is not None:
             category_ids = await self._category_ids(
-                filters.category_id, filters.include_child
+                context, filters.category_id, filters.include_child
             )
             conditions.append(Asset.category_id.in_(category_ids))
         if filters.dept_id is not None:
@@ -148,25 +157,32 @@ class ReportService:
     def _status_label(self, status: str) -> str:
         return ASSET_STATUS_LABELS.get(status, status)
 
-    def _asset_row(self, asset: Asset) -> ReportAssetRow:
+    def _asset_row(self, asset: Asset, context: AuthContext) -> ReportAssetRow:
+        def visible(field: str, value: Any) -> Any:
+            return value if context.can_view_field("asset", field) else None
+
+        custodian_name = asset.custodian.real_name if asset.custodian else None
         return ReportAssetRow(
             id=asset.id,
             asset_no=asset.asset_no,
-            name=asset.name,
+            name=asset.name if context.can_view_field("asset", "name") else "已隐藏",
             category_name=asset.category.name if asset.category else None,
             model_name=asset.model.name if asset.model else None,
-            serial_no=asset.serial_no,
+            serial_no=visible("serial_no", asset.serial_no),
             dept_name=asset.dept.name if asset.dept else None,
-            custodian_name=asset.custodian.real_name if asset.custodian else None,
+            custodian_name=visible("custodian_id", custodian_name),
             status=asset.status,
             status_label=self._status_label(asset.status),
-            purchase_date=asset.purchase_date,
-            purchase_price=float(asset.purchase_price)
-            if asset.purchase_price is not None
-            else None,
-            warranty_end=asset.warranty_end,
-            location=asset.location,
-            supplier=asset.supplier,
+            purchase_date=visible("purchase_date", asset.purchase_date),
+            purchase_price=visible(
+                "purchase_price",
+                float(asset.purchase_price)
+                if asset.purchase_price is not None
+                else None,
+            ),
+            warranty_end=visible("warranty_end", asset.warranty_end),
+            location=visible("location", asset.location),
+            supplier=visible("supplier", asset.supplier),
         )
 
     async def overview(
@@ -174,6 +190,7 @@ class ReportService:
     ) -> AssetReportOverviewOut:
         conditions = await self._conditions(context, filters)
         today = now_cst().date()
+        price_visible = context.can_view_field("asset", "purchase_price")
 
         status_rows = (
             await self.session.execute(
@@ -190,7 +207,7 @@ class ReportService:
         status_values: dict[str, float] = {status: 0.0 for status in ASSET_STATUS_LABELS}
         for status, count, value in status_rows:
             status_counts[str(status)] = int(count)
-            status_values[str(status)] = float(value or 0)
+            status_values[str(status)] = float(value or 0) if price_visible else 0.0
 
         total_count = sum(status_counts.values())
         total_value = round(sum(status_values.values()), 2)
@@ -248,9 +265,13 @@ class ReportService:
                 )
             )
 
-        dept_distribution = await self._dept_distribution(conditions)
-        category_distribution = await self._category_distribution(conditions)
-        purchase_trend = await self._purchase_trend(conditions, today)
+        dept_distribution = await self._dept_distribution(conditions, price_visible)
+        category_distribution = await self._category_distribution(
+            conditions, price_visible
+        )
+        purchase_trend = await self._purchase_trend(
+            conditions, today, price_visible
+        )
 
         return AssetReportOverviewOut(
             metrics=ReportMetrics(
@@ -273,12 +294,14 @@ class ReportService:
             category_distribution=category_distribution,
             purchase_trend=purchase_trend,
             data_scope_label=DATA_SCOPE_LABELS.get(
-                context.data_scope, context.data_scope
+                context.effective_scope("report"), context.data_scope
             ),
             generated_at=now_cst(),
         )
 
-    async def _dept_distribution(self, conditions: list[Any]) -> list[ReportDeptSlice]:
+    async def _dept_distribution(
+        self, conditions: list[Any], price_visible: bool = True
+    ) -> list[ReportDeptSlice]:
         rows = (
             await self.session.execute(
                 select(
@@ -301,13 +324,13 @@ class ReportService:
                 dept_id=int(dept_id) if dept_id is not None else None,
                 name=name or "未分配部门",
                 count=int(count),
-                value=round(float(value or 0), 2),
+                value=round(float(value or 0), 2) if price_visible else 0.0,
             )
             for dept_id, name, count, value in rows
         ]
 
     async def _category_distribution(
-        self, conditions: list[Any]
+        self, conditions: list[Any], price_visible: bool = True
     ) -> list[ReportCategorySlice]:
         rows = (
             await self.session.execute(
@@ -331,13 +354,13 @@ class ReportService:
                 category_id=int(category_id),
                 name=name,
                 count=int(count),
-                value=round(float(value or 0), 2),
+                value=round(float(value or 0), 2) if price_visible else 0.0,
             )
             for category_id, name, count, value in rows
         ]
 
     async def _purchase_trend(
-        self, conditions: list[Any], today: date
+        self, conditions: list[Any], today: date, price_visible: bool = True
     ) -> list[ReportTrendPoint]:
         months = _month_sequence(today, _TREND_MONTHS)
         start_date = date(months[0][0], months[0][1], 1)
@@ -360,7 +383,9 @@ class ReportService:
             ReportTrendPoint(
                 month=f"{year:04d}-{month:02d}",
                 count=counts.get((year, month), 0),
-                value=round(values.get((year, month), 0.0), 2),
+                value=round(values.get((year, month), 0.0), 2)
+                if price_visible
+                else 0.0,
             )
             for year, month in months
         ]
@@ -394,13 +419,15 @@ class ReportService:
             .all()
         )
         return ReportAssetPage(
-            items=[self._asset_row(asset) for asset in rows],
+            items=[self._asset_row(asset, context) for asset in rows],
             total=total,
             page=page,
             page_size=page_size,
         )
 
-    async def _asset_rows(self, conditions: list[Any]) -> list[ReportAssetRow]:
+    async def _asset_rows(
+        self, context: AuthContext, conditions: list[Any]
+    ) -> list[ReportAssetRow]:
         rows = (
             (
                 await self.session.execute(
@@ -413,7 +440,7 @@ class ReportService:
             .scalars()
             .all()
         )
-        return [self._asset_row(asset) for asset in rows]
+        return [self._asset_row(asset, context) for asset in rows]
 
     def _idle_since_subquery(self):
         return (
@@ -463,7 +490,7 @@ class ReportService:
             since = idle_since or asset.updated_at
             items.append(
                 IdleAssetRow(
-                    **self._asset_row(asset).model_dump(),
+                    **self._asset_row(asset, context).model_dump(),
                     idle_since=since,
                     idle_days=max((now - since).days, 0),
                 )
@@ -475,7 +502,9 @@ class ReportService:
             page_size=page_size,
         )
 
-    async def _idle_rows(self, conditions: list[Any]) -> list[IdleAssetRow]:
+    async def _idle_rows(
+        self, context: AuthContext, conditions: list[Any]
+    ) -> list[IdleAssetRow]:
         idle_subq = self._idle_since_subquery()
         rows = (
             await self.session.execute(
@@ -492,7 +521,7 @@ class ReportService:
         now = now_cst()
         return [
             IdleAssetRow(
-                **self._asset_row(asset).model_dump(),
+                **self._asset_row(asset, context).model_dump(),
                 idle_since=idle_since or asset.updated_at,
                 idle_days=max((now - (idle_since or asset.updated_at)).days, 0),
             )
@@ -611,6 +640,7 @@ class ReportService:
 
     async def _compliance_assets(
         self,
+        context: AuthContext,
         conditions: list[Any],
         *,
         issue_type: str | None,
@@ -653,7 +683,7 @@ class ReportService:
             ]
             rows.append(
                 ComplianceAssetRow(
-                    **self._asset_row(asset).model_dump(),
+                    **self._asset_row(asset, context).model_dump(),
                     issues=issues,
                 )
             )
@@ -678,7 +708,9 @@ class ReportService:
         page_size: int,
     ) -> ComplianceAssetPage:
         conditions = await self._conditions(context, filters)
-        rows = await self._compliance_assets(conditions, issue_type=issue_type)
+        rows = await self._compliance_assets(
+            context, conditions, issue_type=issue_type
+        )
         start = (page - 1) * page_size
         return ComplianceAssetPage(
             items=rows[start : start + page_size],
@@ -689,9 +721,7 @@ class ReportService:
 
     async def options(self, context: AuthContext) -> ReportOptionsOut:
         dept_stmt = select(Dept).where(Dept.status == 1)
-        allowed = await scoped_dept_ids(self.session, context)
-        if is_self_only(context):
-            allowed = {context.user.dept_id} if context.user.dept_id else set()
+        allowed = await scoped_dept_ids(self.session, context, resource="report")
         if allowed is not None:
             dept_stmt = dept_stmt.where(
                 Dept.id.in_(allowed) if allowed else Dept.id.in_([-1])
@@ -705,10 +735,16 @@ class ReportService:
             .scalars()
             .all()
         )
+        category_stmt = select(AssetCategory)
+        domains = context.allowed_domains("report")
+        if domains is not None:
+            category_stmt = category_stmt.where(
+                AssetCategory.asset_domain.in_(domains)
+            )
         categories = (
             (
                 await self.session.execute(
-                    select(AssetCategory).order_by(
+                    category_stmt.order_by(
                         AssetCategory.path, AssetCategory.sort, AssetCategory.id
                     )
                 )
@@ -744,6 +780,7 @@ class ReportService:
     async def _filter_description(
         self, context: AuthContext, filters: ReportFilters
     ) -> str:
+        allowed = await scoped_dept_ids(self.session, context, resource="report")
         parts = []
         if filters.keyword:
             parts.append(f"关键字：{filters.keyword.strip()}")
@@ -755,7 +792,9 @@ class ReportService:
                     select(AssetCategory).where(AssetCategory.id == filters.category_id)
                 )
             ).scalar_one_or_none()
-            if category is not None:
+            if category is not None and category_domain_allowed(
+                category, context, "report"
+            ):
                 suffix = "（含下级）" if filters.include_child else ""
                 parts.append(f"分类：{category.name}{suffix}")
         if filters.dept_id is not None:
@@ -764,13 +803,12 @@ class ReportService:
                     select(Dept).where(Dept.id == filters.dept_id)
                 )
             ).scalar_one_or_none()
-            if dept is not None:
+            if dept is not None and (allowed is None or dept.id in allowed):
                 parts.append(f"部门：{dept.name}")
         if filters.purchase_from or filters.purchase_to:
             start = filters.purchase_from.isoformat() if filters.purchase_from else "不限"
             end = filters.purchase_to.isoformat() if filters.purchase_to else "不限"
             parts.append(f"采购日期：{start} 至 {end}")
-        allowed = await scoped_dept_ids(self.session, context)
         if allowed is not None:
             parts.append("数据范围：当前角色可见范围")
         return "；".join(parts) or "全部资产"
@@ -795,7 +833,8 @@ class ReportService:
         conditions = await self._conditions(context, filters)
         today = now_cst().date()
         filter_text = await self._filter_description(context, filters)
-        data_scope = DATA_SCOPE_LABELS.get(context.data_scope, context.data_scope)
+        report_scope = context.effective_scope("report")
+        data_scope = DATA_SCOPE_LABELS.get(report_scope, report_scope)
         generated_at = now_cst()
         overview = None
         rows: list[Any] = []
@@ -805,17 +844,17 @@ class ReportService:
         if report_type == "OVERVIEW":
             overview = await self.overview(context, filters)
         elif report_type == "ASSETS":
-            rows = await self._asset_rows(conditions)
+            rows = await self._asset_rows(context, conditions)
         elif report_type == "IDLE":
             idle_conditions = await self._conditions(
                 context, filters, apply_status=False
             )
             idle_conditions.append(Asset.status == AssetStatus.IDLE)
-            rows = await self._idle_rows(idle_conditions)
+            rows = await self._idle_rows(context, idle_conditions)
         else:
             compliance_conditions = await self._conditions(context, filters)
             rows = await self._compliance_assets(
-                compliance_conditions, issue_type=issue_type
+                context, compliance_conditions, issue_type=issue_type
             )
             summary = await self.compliance_summary(context, filters)
             compliance_items = summary.items

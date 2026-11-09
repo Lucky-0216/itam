@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 _CATEGORY_CODE_RE = re.compile(r"^[A-Z0-9][A-Z0-9_-]{1,49}$")
 _MODEL_CODE_RE = re.compile(r"^[A-Z0-9][A-Z0-9._-]{1,49}$")
+_DOMAIN_CODE_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,19}$")
 _FIELD_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{1,49}$")
 _ASSET_NO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,49}$")
 
@@ -81,11 +82,51 @@ class CategoryFieldOut(BaseModel):
     version: int
 
 
+class AssetDomainCreate(BaseModel):
+    code: str = Field(min_length=1, max_length=20)
+    name: str = Field(min_length=1, max_length=50)
+    sort: int = Field(default=100, ge=0, le=9999)
+
+    @field_validator("code", mode="before")
+    @classmethod
+    def normalize_code(cls, value: object) -> str:
+        code = str(value or "").strip().upper()
+        if not _DOMAIN_CODE_RE.fullmatch(code):
+            raise ValueError("资产域编码需为 1-20 位大写字母、数字或下划线，且以字母开头")
+        return code
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def trim_name(cls, value: object) -> object:
+        return _trim_text(value)
+
+
+class AssetDomainUpdate(BaseModel):
+    name: str = Field(min_length=1, max_length=50)
+    sort: int = Field(default=100, ge=0, le=9999)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def trim_name(cls, value: object) -> object:
+        return _trim_text(value)
+
+
+class AssetDomainOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    code: str
+    name: str
+    sort: int
+    is_builtin: bool
+
+
 class CategoryCreate(BaseModel):
     parent_id: int | None = Field(default=None, gt=0)
     name: str = Field(min_length=1, max_length=100)
     code: str = Field(min_length=2, max_length=50)
     category_type: Literal["HARDWARE", "SOFTWARE", "ACCESSORY", "CONSUMABLE"] | None = None
+    asset_domain: str | None = Field(default=None, min_length=1, max_length=20)
     sort: int = Field(default=0, ge=0, le=9999)
     safety_stock: int = Field(default=0, ge=0, le=99999)
     status: int = Field(default=1, ge=0, le=1)
@@ -104,9 +145,20 @@ class CategoryCreate(BaseModel):
             raise ValueError("分类编码需为 2-50 位大写字母、数字、下划线或短横线")
         return code
 
+    @field_validator("asset_domain", mode="before")
+    @classmethod
+    def normalize_domain(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        code = str(value).strip().upper()
+        if not _DOMAIN_CODE_RE.fullmatch(code):
+            raise ValueError("资产域编码需为 1-20 位大写字母、数字或下划线，且以字母开头")
+        return code
+
 
 class CategoryUpdate(CategoryCreate):
     version: int = Field(ge=1)
+    confirm_domain_change: bool = False
 
 
 class CategoryOut(BaseModel):
@@ -115,6 +167,7 @@ class CategoryOut(BaseModel):
     name: str
     code: str
     category_type: str
+    asset_domain: str
     path: str
     level: int
     sort: int
@@ -165,6 +218,7 @@ class ModelCreate(BaseModel):
 
 class ModelUpdate(ModelCreate):
     version: int = Field(ge=1)
+    confirm_domain_change: bool = False
 
 
 class ModelOut(BaseModel):

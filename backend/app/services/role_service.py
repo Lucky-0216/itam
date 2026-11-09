@@ -3,15 +3,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import BizError, ConflictError, NotFoundError, PermissionDenied
 from app.core.permissions import (
+    DATA_RESOURCE_LABELS,
     DATA_SCOPE_LABELS,
     FIELD_CATALOG,
     SUPER_ADMIN_ROLE,
     DataScope,
+    DomainScope,
 )
 from app.models import (
+    AssetDomain,
     Dept,
     Menu,
     Role,
+    RoleDataPermission,
+    RoleDomain,
     RoleFieldPermission,
     User,
     role_depts,
@@ -22,12 +27,14 @@ from app.models.base import now_cst
 from app.repositories.role_repo import RoleRepository
 from app.repositories.user_repo import UserRepository
 from app.schemas.rbac import (
-    DataScopeAssignRequest,
+    DataPermissionsAssignRequest,
     DataScopeOption,
     FieldPermissionItem,
     FieldPermissionsAssignRequest,
     MenuAdminNode,
     MenuAssignRequest,
+    ResourceDataPermissionItem,
+    ResourceOption,
     RoleBriefOut,
     RoleCreate,
     RoleDetailOut,
@@ -52,6 +59,8 @@ def _role_out(role: Role, user_count: int = 0, menu_count: int = 0) -> RoleOut:
         description=role.description,
         data_scope=role.data_scope,
         data_scope_label=DATA_SCOPE_LABELS.get(role.data_scope, role.data_scope),
+        domain_scope=role.domain_scope,
+        asset_domains=sorted(grant.domain.code for grant in role.domain_grants),
         status=role.status,
         sort=role.sort,
         is_system=role.is_system,
@@ -69,6 +78,8 @@ def _snapshot(role: Role, members: list[User] | None = None) -> dict[str, object
         "name": role.name,
         "description": role.description,
         "data_scope": role.data_scope,
+        "domain_scope": role.domain_scope,
+        "asset_domains": sorted(grant.domain.code for grant in role.domain_grants),
         "status": role.status,
         "sort": role.sort,
         "menu_ids": sorted(menu.id for menu in role.menus),
@@ -138,14 +149,32 @@ class RoleService:
             for user in users
         ]
 
-    @staticmethod
-    def meta() -> RoleMetaOut:
+    async def meta(self, context: AuthContext) -> RoleMetaOut:
+        domains = list(
+            (
+                await self.session.execute(
+                    select(AssetDomain).order_by(AssetDomain.sort, AssetDomain.id)
+                )
+            ).scalars().all()
+        )
+        if context.allowed_domains() is not None:
+            allowed = set(context.asset_domains)
+            domains = [domain for domain in domains if domain.code in allowed]
         return RoleMetaOut(
             data_scopes=[
                 DataScopeOption(value=value, label=label)
                 for value, label in DATA_SCOPE_LABELS.items()
+                if value != DataScope.ROLE
             ],
             field_catalog=FIELD_CATALOG,
+            data_resources=[
+                ResourceOption(value=value, label=label)
+                for value, label in DATA_RESOURCE_LABELS.items()
+            ],
+            asset_domains=[
+                DataScopeOption(value=domain.code, label=domain.name)
+                for domain in domains
+            ],
         )
 
     async def menu_tree(self) -> list[MenuAdminNode]:
@@ -194,19 +223,26 @@ class RoleService:
         if await self.roles.get_by_code(payload.code):
             raise ConflictError("角色编码已存在", code=40930)
         self._assert_scope_grantable(payload.data_scope, context)
+        domains = await self._resolve_domains(
+            payload.domain_scope, payload.asset_domains, context
+        )
 
         role = Role(
             code=payload.code,
             name=payload.name,
             description=payload.description,
             data_scope=payload.data_scope,
+            domain_scope=payload.domain_scope,
             sort=payload.sort,
             status=payload.status,
             is_system=False,
             menus=[],
             depts=[],
+            domain_grants=[],
         )
         self.session.add(role)
+        await self.session.flush()
+        role.domain_grants = [RoleDomain(domain=domain) for domain in domains]
         await self.session.flush()
         await self.audit.record(
             action="rbac.role.create",
@@ -239,6 +275,16 @@ class RoleService:
                     can_edit=row.can_edit,
                 )
                 for row in fields
+            ],
+            data_permissions=[
+                ResourceDataPermissionItem(
+                    resource=row.resource,
+                    data_scope=row.data_scope,
+                    dept_ids=row.dept_ids or [],
+                )
+                for row in sorted(
+                    role.data_permissions, key=lambda item: item.resource
+                )
             ],
             users=[
                 RoleMemberOut(
@@ -299,6 +345,10 @@ class RoleService:
         await self.session.execute(
             delete(RoleFieldPermission).where(RoleFieldPermission.role_id == role.id)
         )
+        await self.session.execute(
+            delete(RoleDataPermission).where(RoleDataPermission.role_id == role.id)
+        )
+        await self.session.execute(delete(RoleDomain).where(RoleDomain.role_id == role.id))
         result = await self.session.execute(
             delete(Role)
             .where(Role.id == role.id, Role.version == role.version)
@@ -373,10 +423,10 @@ class RoleService:
         await commit_or_conflict(self.session)
         return await self.detail(role.id, context)
 
-    async def assign_data_scope(
+    async def assign_data_permissions(
         self,
         role_id: int,
-        payload: DataScopeAssignRequest,
+        payload: DataPermissionsAssignRequest,
         context: AuthContext,
     ) -> RoleDetailOut:
         role = await self.roles.get_with_relations(role_id)
@@ -385,44 +435,72 @@ class RoleService:
         if role.version != payload.version:
             raise ConflictError("角色权限已被他人修改，请刷新后重试")
         if role.code == SUPER_ADMIN_ROLE:
-            raise BizError("超级管理员固定为全部数据范围，无需分配")
+            raise BizError("超级管理员固定拥有全部数据权限，无需分配")
         self._assert_role_editable(role, context)
         self._assert_scope_grantable(payload.data_scope, context)
+        for item in payload.permissions:
+            self._assert_scope_grantable(item.data_scope, context)
+        domains = await self._resolve_domains(
+            payload.domain_scope, payload.asset_domains, context
+        )
 
-        before = {
-            "data_scope": role.data_scope,
-            "dept_ids": sorted(dept.id for dept in role.depts),
-        }
-        dept_ids: list[int] = []
-        if payload.data_scope == DataScope.CUSTOM:
-            if not payload.dept_ids:
-                raise BizError("自定义数据范围至少需要选择一个部门")
-            dept_rows = list(
-                (await self.session.execute(select(Dept).where(Dept.id.in_(payload.dept_ids))))
-                .scalars()
-                .all()
-            )
-            if len(dept_rows) != len(set(payload.dept_ids)):
-                raise BizError("包含不存在的部门")
-            allowed = await scoped_dept_ids(self.session, context)
-            if allowed is not None and not set(payload.dept_ids).issubset(allowed):
-                raise PermissionDenied("不能将数据范围授权到自身数据范围之外")
-            dept_ids = sorted(dept.id for dept in dept_rows)
-            role.depts = dept_rows
-        else:
-            role.depts = []
+        if payload.data_scope == DataScope.CUSTOM and not payload.dept_ids:
+            raise BizError("全局自定义数据范围至少需要选择一个部门")
+        for item in payload.permissions:
+            if item.data_scope == DataScope.CUSTOM and not item.dept_ids:
+                raise BizError(f"{DATA_RESOURCE_LABELS[item.resource]}需要选择自定义部门")
+
+        all_dept_ids = set(payload.dept_ids)
+        for item in payload.permissions:
+            all_dept_ids.update(item.dept_ids)
+        dept_rows = await self._validated_depts(all_dept_ids, context)
+        global_depts = [dept for dept in dept_rows if dept.id in payload.dept_ids]
+
+        before = _snapshot(role)
+        before["resource_permissions"] = [
+            {
+                "resource": row.resource,
+                "data_scope": row.data_scope,
+                "dept_ids": row.dept_ids or [],
+            }
+            for row in role.data_permissions
+        ]
 
         role.data_scope = payload.data_scope
+        role.depts = global_depts if payload.data_scope == DataScope.CUSTOM else []
+        role.domain_scope = payload.domain_scope
+        role.domain_grants.clear()
+        role.data_permissions.clear()
+        await self.session.flush()
+        role.domain_grants = [RoleDomain(domain=domain) for domain in domains]
+        role.data_permissions = [
+            RoleDataPermission(
+                role_id=role.id,
+                resource=item.resource,
+                data_scope=item.data_scope,
+                dept_ids=item.dept_ids if item.data_scope == DataScope.CUSTOM else [],
+            )
+            for item in payload.permissions
+        ]
         role.updated_at = now_cst()
+
         await self.audit.record(
             action="rbac.role.assign_data",
             module="角色权限",
-            summary=f"分配角色数据范围：{role.name}",
+            summary=f"分配角色数据权限与资产域：{role.name}",
             actor=context.user,
             resource_type="role",
             resource_id=role.id,
             before=before,
-            after={"data_scope": role.data_scope, "dept_ids": dept_ids},
+            after={
+                "data_scope": payload.data_scope,
+                "dept_ids": payload.dept_ids,
+                "domain_scope": payload.domain_scope,
+                "asset_domains": payload.asset_domains,
+                "resource_permissions": [
+                    item.model_dump() for item in payload.permissions
+                ],
+            },
         )
         await commit_or_conflict(self.session)
         return await self.detail(role.id, context)
@@ -506,6 +584,7 @@ class RoleService:
 
         if not context.is_superuser:
             self._assert_menus_grantable(list(role.menus), context)
+            self._assert_role_domains_grantable(role, context)
             if role.data_scope == DataScope.ALL and context.data_scope != DataScope.ALL:
                 raise PermissionDenied("不能分配超出自身数据范围的角色")
             allowed = await scoped_dept_ids(self.session, context)
@@ -550,6 +629,59 @@ class RoleService:
         )
         await commit_or_conflict(self.session)
         return await self.detail(role.id, context)
+
+    async def _resolve_domains(
+        self,
+        domain_scope: str,
+        codes: list[str],
+        context: AuthContext,
+    ) -> list[AssetDomain]:
+        if not context.is_superuser and context.domain_scope != DomainScope.ALL:
+            if domain_scope == DomainScope.ALL:
+                raise PermissionDenied("不能授予超出自身资产域范围的全部域权限")
+            if not set(codes).issubset(context.asset_domains):
+                raise PermissionDenied("不能授予自身未拥有的资产域")
+        if domain_scope == DomainScope.ALL:
+            return []
+        if not codes:
+            return []
+        domains = list(
+            (
+                await self.session.execute(
+                    select(AssetDomain).where(AssetDomain.code.in_(codes))
+                )
+            ).scalars().all()
+        )
+        if len(domains) != len(set(codes)):
+            raise BizError("包含不存在的资产域")
+        return sorted(domains, key=lambda domain: (domain.sort, domain.id))
+
+    async def _validated_depts(
+        self, dept_ids: set[int], context: AuthContext
+    ) -> list[Dept]:
+        if not dept_ids:
+            return []
+        rows = list(
+            (
+                await self.session.execute(select(Dept).where(Dept.id.in_(dept_ids)))
+            ).scalars().all()
+        )
+        if len(rows) != len(dept_ids):
+            raise BizError("包含不存在的部门")
+        allowed = await scoped_dept_ids(self.session, context)
+        if allowed is not None and not dept_ids.issubset(allowed):
+            raise PermissionDenied("不能将数据范围授权到自身数据范围之外")
+        return rows
+
+    @staticmethod
+    def _assert_role_domains_grantable(role: Role, context: AuthContext) -> None:
+        if context.is_superuser or context.domain_scope == DomainScope.ALL:
+            return
+        if role.domain_scope == DomainScope.ALL:
+            raise PermissionDenied("不能分配超出自身资产域范围的角色")
+        role_domains = {grant.domain.code for grant in role.domain_grants}
+        if not role_domains.issubset(context.asset_domains):
+            raise PermissionDenied("不能分配超出自身资产域范围的角色")
 
     def _assert_role_editable(self, role: Role, context: AuthContext) -> None:
         if role.is_system and not context.is_superuser:

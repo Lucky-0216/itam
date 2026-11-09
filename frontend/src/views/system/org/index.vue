@@ -45,6 +45,7 @@ const deptTreeRef = ref<InstanceType<typeof ElTree>>()
 const deptTree = ref<DeptNode[]>([])
 const deptLoading = ref(false)
 const deptKeyword = ref('')
+const deptSourceFilter = ref('')
 const selectedDeptId = ref<number | null>(parseDeptId(route.query.dept_id))
 const deptTreeProps = { label: 'name', children: 'children' }
 
@@ -57,6 +58,7 @@ const query = reactive({
   page_size: 10,
   keyword: typeof route.query.keyword === 'string' ? route.query.keyword : '',
   status: undefined as number | undefined,
+  source: undefined as string | undefined,
   include_child: true,
 })
 let userRequestSeq = 0
@@ -92,6 +94,15 @@ const canManageDept = computed(
     auth.hasPerm('system:dept:update') ||
     auth.hasPerm('system:dept:delete'),
 )
+const isSuperAdmin = computed(() => auth.isSuperAdmin)
+
+function canEditRow(row: OrgUser): boolean {
+  return row.source === 'local' || isSuperAdmin.value
+}
+
+function canEditDept(node: DeptNode): boolean {
+  return node.source === 'local' || isSuperAdmin.value
+}
 
 const selectedDeptName = computed(() => {
   if (selectedDeptId.value === null) return '全部部门'
@@ -137,7 +148,7 @@ watch(deptKeyword, (value) => {
 async function loadDeptTree(): Promise<void> {
   deptLoading.value = true
   try {
-    deptTree.value = await orgApi.departmentTree()
+    deptTree.value = await orgApi.departmentTree(deptSourceFilter.value || undefined)
     if (selectedDeptId.value !== null && !findDept(deptTree.value, selectedDeptId.value)) {
       selectedDeptId.value = null
       query.page = 1
@@ -153,6 +164,10 @@ async function loadDeptTree(): Promise<void> {
   }
 }
 
+watch(deptSourceFilter, () => {
+  void loadDeptTree()
+})
+
 async function loadUsers(): Promise<void> {
   const seq = ++userRequestSeq
   userLoading.value = true
@@ -164,6 +179,7 @@ async function loadUsers(): Promise<void> {
       dept_id: selectedDeptId.value ?? undefined,
       include_child: query.include_child,
       status: query.status,
+      source: query.source || undefined,
     })
     if (seq !== userRequestSeq) return
     users.value = data.items
@@ -181,6 +197,7 @@ function handleSearch(): void {
 function resetFilters(): void {
   query.keyword = ''
   query.status = undefined
+  query.source = undefined
   query.include_child = true
   query.page = 1
   void loadUsers()
@@ -806,6 +823,16 @@ onMounted(() => {
             placeholder="搜索部门名称 / 编码"
             clearable
           />
+          <el-select
+            v-model="deptSourceFilter"
+            placeholder="来源"
+            class="dept-source-filter"
+            clearable
+          >
+            <el-option label="本地" value="local" />
+            <el-option label="域控" value="ldap" />
+            <el-option label="钉钉" value="dingtalk" />
+          </el-select>
         </div>
 
         <button
@@ -842,6 +869,14 @@ onMounted(() => {
                     <el-tag v-if="data.source === 'ldap'" size="small" type="info" effect="plain">
                       域控
                     </el-tag>
+                    <el-tag
+                      v-if="data.source === 'dingtalk'"
+                      size="small"
+                      type="warning"
+                      effect="plain"
+                    >
+                      钉钉
+                    </el-tag>
                   </span>
                 </span>
                 <span class="dept-node-side" @click.stop>
@@ -849,7 +884,7 @@ onMounted(() => {
                     {{ data.user_count }}
                   </span>
                   <el-dropdown
-                    v-if="canManageDept"
+                    v-if="canManageDept && canEditDept(data)"
                     trigger="click"
                     @command="handleDeptCommand($event, data)"
                   >
@@ -934,6 +969,17 @@ onMounted(() => {
             <el-option label="启用" :value="1" />
             <el-option label="停用" :value="0" />
           </el-select>
+          <el-select
+            v-model="query.source"
+            placeholder="来源"
+            class="filter-status"
+            clearable
+            @change="handleSearch"
+          >
+            <el-option label="本地" value="local" />
+            <el-option label="域控" value="ldap" />
+            <el-option label="钉钉" value="dingtalk" />
+          </el-select>
           <el-checkbox v-model="query.include_child" @change="handleSearch">
             包含下级部门
           </el-checkbox>
@@ -963,6 +1009,15 @@ onMounted(() => {
                       round
                     >
                       域控
+                    </el-tag>
+                    <el-tag
+                      v-if="row.source === 'dingtalk'"
+                      size="small"
+                      type="warning"
+                      effect="plain"
+                      round
+                    >
+                      钉钉
                     </el-tag>
                     <el-tag
                       v-if="row.id === auth.profile?.id"
@@ -1025,7 +1080,7 @@ onMounted(() => {
               <el-switch
                 :model-value="row.status === 1"
                 :loading="statusLoadingId === row.id"
-                :disabled="!canUpdateUser || row.id === auth.profile?.id"
+                :disabled="!canUpdateUser || row.id === auth.profile?.id || !canEditRow(row)"
                 inline-prompt
                 active-text="启用"
                 inactive-text="停用"
@@ -1049,6 +1104,8 @@ onMounted(() => {
                   type="primary"
                   size="small"
                   :loading="userDialogLoading"
+                  :disabled="!canEditRow(row)"
+                  :title="canEditRow(row) ? '' : '外部来源用户由同步任务维护，仅超级管理员可修改'"
                   @click="openEditUser(row)"
                 >
                   编辑
@@ -1069,7 +1126,8 @@ onMounted(() => {
                   link
                   type="danger"
                   size="small"
-                  :disabled="row.id === auth.profile?.id"
+                  :disabled="row.id === auth.profile?.id || !canEditRow(row)"
+                  :title="canEditRow(row) ? '' : '外部来源用户由同步任务维护，仅超级管理员可删除'"
                   @click="deleteUser(row)"
                 >
                   删除
@@ -1224,6 +1282,15 @@ onMounted(() => {
           class="ldap-edit-alert"
           title="该账号来自域控同步"
           description="姓名、工号、邮箱、电话、部门与状态将在下次同步时以域控数据为准；域控账号密码由 AD 域管理。"
+        />
+        <el-alert
+          v-if="userForm.source === 'dingtalk'"
+          type="warning"
+          :closable="false"
+          show-icon
+          class="ldap-edit-alert"
+          title="该账号来自钉钉通讯录同步"
+          description="姓名、手机、邮箱、工号、部门与状态将在下次同步时以钉钉数据为准。"
         />
         <div class="form-grid">
           <el-form-item label="用户名" prop="username">
@@ -1441,7 +1508,14 @@ onMounted(() => {
 }
 
 .dept-search {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   margin-bottom: 10px;
+}
+
+.dept-source-filter {
+  width: 100%;
 }
 
 .dept-all {

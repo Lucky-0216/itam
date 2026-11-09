@@ -68,6 +68,7 @@ class UserRepository(BaseRepository[User]):
         dept_ids: set[int] | None = None,
         status: int | None = None,
         role_id: int | None = None,
+        source: str | None = None,
         self_user_id: int | None = None,
     ) -> tuple[list[User], int]:
         conditions = [User.deleted_at.is_(None)]
@@ -90,6 +91,8 @@ class UserRepository(BaseRepository[User]):
             conditions.append(User.status == status)
         if role_id is not None:
             conditions.append(User.roles.any(Role.id == role_id))
+        if source is not None:
+            conditions.append(User.source == source)
         if self_user_id is not None:
             conditions.append(User.id == self_user_id)
 

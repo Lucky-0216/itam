@@ -121,3 +121,6 @@ class CurrentUserOut(BaseModel):
     custom_dept_ids: list[int]
     menus: list[MenuNode]
     field_permissions: dict[str, dict[str, FieldPermissionOut]]
+    domain_scope: str
+    asset_domains: list[str]
+    resource_scopes: dict[str, str]

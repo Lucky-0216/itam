@@ -21,7 +21,6 @@ from app.core.maintenance import (
     MaintenanceStatus,
     assert_maintenance_transition,
 )
-from app.core.permissions import DataScope
 from app.models import (
     Asset,
     AssetHistory,
@@ -52,7 +51,12 @@ from app.schemas.maintenance import (
 from app.services.asset_snapshot import asset_snapshot
 from app.services.audit_service import AuditService
 from app.services.permission_service import AuthContext
-from app.services.scope_service import scoped_dept_ids
+from app.services.scope_service import (
+    asset_domain_condition,
+    category_domain_allowed,
+    is_self_only,
+    scoped_dept_ids,
+)
 from app.services.txn import commit_or_conflict
 
 STATUS_CONFLICT_MESSAGE = "资产状态已变更，请刷新后重试"
@@ -110,11 +114,35 @@ class MaintenanceService:
         return item
 
     async def _allowed_depts(self, context: AuthContext) -> set[int] | None:
-        return await scoped_dept_ids(self.session, context)
+        return await scoped_dept_ids(self.session, context, resource="maintenance")
+
+    @staticmethod
+    def _order_domain_condition(context: AuthContext):
+        domain_condition = asset_domain_condition(context, "maintenance")
+        if domain_condition is None:
+            return None
+        return AssetMaintenance.asset_id.in_(
+            select(Asset.id).where(domain_condition)
+        )
+
+    @staticmethod
+    def _in_order_domain(item: AssetMaintenance, context: AuthContext) -> bool:
+        return category_domain_allowed(
+            item.asset.category, context, "maintenance"
+        )
 
     @staticmethod
     def _in_scope(dept_id: int | None, allowed: set[int] | None) -> bool:
         return allowed is None or (dept_id is not None and dept_id in allowed)
+
+    def _manager_scope(
+        self, item: AssetMaintenance, context: AuthContext, allowed: set[int] | None
+    ) -> bool:
+        if not self._in_order_domain(item, context):
+            return False
+        if is_self_only(context, "maintenance"):
+            return item.applicant_id == context.user.id
+        return self._in_scope(item.from_dept_id, allowed)
 
     @staticmethod
     def _is_manager(context: AuthContext) -> bool:
@@ -127,11 +155,15 @@ class MaintenanceService:
     ) -> bool:
         if context.is_superuser:
             return True
-        if self._is_manager(context):
-            return self._in_scope(item.from_dept_id, allowed)
+        if not self._in_order_domain(item, context):
+            return False
         user_id = context.user.id
         if item.repairer_id == user_id:
             return True
+        if self._is_manager(context):
+            return self._manager_scope(item, context, allowed)
+        if is_self_only(context, "maintenance"):
+            return item.applicant_id == user_id
         return item.applicant_id == user_id or item.from_custodian_id == user_id
 
     async def _assert_view(
@@ -150,11 +182,13 @@ class MaintenanceService:
     ) -> bool:
         if not context.has_permission("asset:maintenance:repair"):
             return False
+        if not self._in_order_domain(item, context):
+            return False
         if item.repairer_id == context.user.id:
             return True
         return context.has_permission(
             "asset:maintenance:accept"
-        ) and self._in_scope(item.from_dept_id, allowed)
+        ) and self._manager_scope(item, context, allowed)
 
     def _can_cancel(
         self,
@@ -172,10 +206,10 @@ class MaintenanceService:
         ):
             return True
         if context.has_permission("asset:maintenance:cancel"):
-            return self._in_scope(item.from_dept_id, allowed)
+            return self._manager_scope(item, context, allowed)
         return context.has_permission(
             "asset:maintenance:approve"
-        ) and self._in_scope(item.from_dept_id, allowed)
+        ) and self._manager_scope(item, context, allowed)
 
     def _order_out(
         self,
@@ -184,7 +218,7 @@ class MaintenanceService:
         allowed: set[int] | None,
     ) -> MaintenanceOut:
         asset = item.asset
-        manager_scope = self._in_scope(item.from_dept_id, allowed)
+        manager_scope = self._manager_scope(item, context, allowed)
         can_review = (
             item.status == MaintenanceStatus.PENDING_APPROVAL
             and context.has_permission("asset:maintenance:approve")
@@ -311,17 +345,15 @@ class MaintenanceService:
             raise BizError("该资产存在处理中的领用/借用/归还单据，暂不能报修")
 
     async def _assert_can_report(self, asset: Asset, context: AuthContext) -> None:
+        if not category_domain_allowed(asset.category, context, "maintenance"):
+            raise PermissionDenied("无权报修该分类下的资产")
+        if is_self_only(context, "maintenance"):
+            if context.user.id not in (asset.custodian_id, asset.created_by_id):
+                raise PermissionDenied("只能报修本人持有或本人创建的资产")
+            return
         allowed = await self._allowed_depts(context)
         if allowed is not None and asset.dept_id not in allowed:
             raise PermissionDenied("无权报修该部门的资产")
-        if (
-            not context.has_permission("asset:maintenance:approve")
-            and not context.has_permission("asset:maintenance:accept")
-            and not context.has_permission("asset:maintenance:repair")
-            and context.data_scope == DataScope.SELF
-            and asset.custodian_id not in (None, context.user.id)
-        ):
-            raise PermissionDenied("只能报修本人名下或本部门公共资产")
 
     async def option_assets(
         self,
@@ -336,7 +368,17 @@ class MaintenanceService:
             Asset.deleted_at.is_(None),
             Asset.status.in_(REPAIRABLE_ASSET_STATUSES),
         ]
-        if allowed is not None:
+        domain_condition = asset_domain_condition(context, "maintenance")
+        if domain_condition is not None:
+            conditions.append(domain_condition)
+        if is_self_only(context, "maintenance"):
+            conditions.append(
+                or_(
+                    Asset.custodian_id == context.user.id,
+                    Asset.created_by_id == context.user.id,
+                )
+            )
+        elif allowed is not None:
             conditions.append(Asset.dept_id.in_(allowed) if allowed else false())
         if keyword:
             like = f"%{keyword.strip()}%"
@@ -347,8 +389,10 @@ class MaintenanceService:
                     Asset.serial_no.like(like),
                 )
             )
-        if not self._is_manager(context) and not context.has_permission(
-            "asset:maintenance:repair"
+        if (
+            not is_self_only(context, "maintenance")
+            and not self._is_manager(context)
+            and not context.has_permission("asset:maintenance:repair")
         ):
             conditions.append(
                 or_(Asset.custodian_id == context.user.id, Asset.custodian_id.is_(None))
@@ -481,7 +525,17 @@ class MaintenanceService:
         allowed = await self._allowed_depts(context)
         conditions: list = []
         user_id = context.user.id
-        if self._is_manager(context):
+        domain_condition = self._order_domain_condition(context)
+        if domain_condition is not None:
+            conditions.append(domain_condition)
+        if is_self_only(context, "maintenance"):
+            conditions.append(
+                or_(
+                    AssetMaintenance.applicant_id == user_id,
+                    AssetMaintenance.repairer_id == user_id,
+                )
+            )
+        elif self._is_manager(context):
             if allowed is not None:
                 conditions.append(
                     AssetMaintenance.from_dept_id.in_(allowed)
@@ -616,7 +670,7 @@ class MaintenanceService:
     ) -> MaintenanceOut:
         item = await self._get_order(order_id)
         allowed = await self._assert_view(item, context)
-        if not self._in_scope(item.from_dept_id, allowed):
+        if not self._manager_scope(item, context, allowed):
             raise PermissionDenied("无权审批该部门的维修工单")
         if item.status != MaintenanceStatus.PENDING_APPROVAL:
             raise BizError("当前维修工单不在待审批状态")
@@ -687,7 +741,7 @@ class MaintenanceService:
     ) -> MaintenanceOut:
         item = await self._get_order(order_id)
         allowed = await self._assert_view(item, context)
-        if not self._in_scope(item.from_dept_id, allowed):
+        if not self._manager_scope(item, context, allowed):
             raise PermissionDenied("无权审批该部门的维修工单")
         if item.status != MaintenanceStatus.PENDING_APPROVAL:
             raise BizError("当前维修工单不在待审批状态")
@@ -827,7 +881,7 @@ class MaintenanceService:
     ) -> MaintenanceOut:
         item = await self._get_order(order_id)
         allowed = await self._assert_view(item, context)
-        if not self._in_scope(item.from_dept_id, allowed):
+        if not self._manager_scope(item, context, allowed):
             raise PermissionDenied("无权验收该部门的维修工单")
         if item.status != MaintenanceStatus.PENDING_ACCEPTANCE:
             raise BizError("当前维修工单不在待验收状态")

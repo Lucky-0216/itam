@@ -19,6 +19,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.asset import Asset, AssetCategory, AssetModel
 from app.models.base import Base, IdMixin, TimestampMixin, VersionMixin, now_cst
+from app.models.dingtalk import DingTalkApproval
 from app.models.rbac import Dept, User
 
 
@@ -92,6 +93,14 @@ class AssetTransfer(Base, IdMixin, TimestampMixin, VersionMixin):
     asset: Mapped[Asset] = relationship("Asset", lazy="selectin")
     applicant: Mapped[User] = relationship(
         "User", foreign_keys=[applicant_id], lazy="selectin"
+    )
+    dingtalk_approval: Mapped[DingTalkApproval | None] = relationship(
+        primaryjoin=(
+            "and_(foreign(DingTalkApproval.transfer_id) == AssetTransfer.id)"
+        ),
+        uselist=False,
+        lazy="selectin",
+        viewonly=True,
     )
 
 

@@ -5,6 +5,8 @@ import type {
   DeptUpdatePayload,
   OrgUserDetail,
   ResetPasswordPayload,
+  SyncPolicy,
+  SyncPolicyUpdate,
   UserCreatePayload,
   UserPage,
   UserQuery,
@@ -13,8 +15,8 @@ import type {
 } from '@/types/org'
 
 export const orgApi = {
-  departmentTree(): Promise<DeptNode[]> {
-    return request<DeptNode[]>({ url: '/departments/tree' })
+  departmentTree(source?: string): Promise<DeptNode[]> {
+    return request<DeptNode[]>({ url: '/departments/tree', params: { source } })
   },
 
   createDepartment(payload: DeptPayload): Promise<DeptNode> {
@@ -63,5 +65,13 @@ export const orgApi = {
 
   deleteUser(id: number): Promise<null> {
     return request<null>({ url: `/users/${id}`, method: 'delete' })
+  },
+
+  getSyncPolicy(): Promise<SyncPolicy> {
+    return request<SyncPolicy>({ url: '/sync-policy' })
+  },
+
+  updateSyncPolicy(payload: SyncPolicyUpdate): Promise<SyncPolicy> {
+    return request<SyncPolicy>({ url: '/sync-policy', method: 'put', data: payload })
   },
 }

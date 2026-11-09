@@ -69,7 +69,7 @@ async def option_owners(
     ),
     session: AsyncSession = Depends(get_db),
 ):
-    result = await ContractService(session).option_owners(keyword)
+    result = await ContractService(session).option_owners(context, keyword)
     return ok([item.model_dump(mode="json") for item in result])
 
 

@@ -1,7 +1,7 @@
 import { request } from '@/api/request'
 import type {
   AdminMenuNode,
-  DataScopeAssignPayload,
+  DataPermissionsAssignPayload,
   FieldPermissionsAssignPayload,
   MenuAssignPayload,
   RoleBriefOption,
@@ -59,9 +59,12 @@ export const roleApi = {
     return request<RoleDetail>({ url: `/roles/${id}/menus`, method: 'put', data: payload })
   },
 
-  assignDataScope(id: number, payload: DataScopeAssignPayload): Promise<RoleDetail> {
+  assignDataPermissions(
+    id: number,
+    payload: DataPermissionsAssignPayload,
+  ): Promise<RoleDetail> {
     return request<RoleDetail>({
-      url: `/roles/${id}/data-scope`,
+      url: `/roles/${id}/data-permissions`,
       method: 'put',
       data: payload,
     })

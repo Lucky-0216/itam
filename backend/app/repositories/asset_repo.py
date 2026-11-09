@@ -25,16 +25,22 @@ class AssetCategoryRepository(BaseRepository[AssetCategory]):
         )
         return int(await self.session.scalar(stmt) or 0)
 
-    async def model_counts(self) -> dict[int, int]:
+    async def model_counts(
+        self, conditions: list[Any] | None = None
+    ) -> dict[int, int]:
         stmt = select(AssetModel.category_id, func.count(AssetModel.id)).group_by(
             AssetModel.category_id
         )
+        if conditions is not None:
+            stmt = stmt.where(*conditions)
         return {int(category_id): int(count) for category_id, count in (await self.session.execute(stmt)).all()}
 
-    async def asset_counts(self) -> dict[int, int]:
+    async def asset_counts(self, conditions: list[Any] | None = None) -> dict[int, int]:
         stmt = (
             select(Asset.category_id, func.count(Asset.id))
-            .where(Asset.deleted_at.is_(None))
+            .where(
+                *(conditions if conditions is not None else [Asset.deleted_at.is_(None)])
+            )
             .group_by(Asset.category_id)
         )
         return {int(category_id): int(count) for category_id, count in (await self.session.execute(stmt)).all()}
@@ -96,11 +102,16 @@ class AssetModelRepository(BaseRepository[AssetModel]):
         rows = list((await self.session.execute(stmt)).scalars().all())
         return rows, total
 
-    async def count_assets(self, model_id: int) -> int:
+    async def count_assets(
+        self, model_id: int, conditions: list[Any] | None = None
+    ) -> int:
         stmt = (
             select(func.count())
             .select_from(Asset)
-            .where(Asset.model_id == model_id, Asset.deleted_at.is_(None))
+            .where(
+                Asset.model_id == model_id,
+                *(conditions if conditions is not None else [Asset.deleted_at.is_(None)]),
+            )
         )
         return int(await self.session.scalar(stmt) or 0)
 

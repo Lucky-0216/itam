@@ -10,6 +10,7 @@ from app.api.v1 import (
     auth,
     contracts,
     dashboard,
+    dingtalk,
     imports,
     inbound,
     ldap,
@@ -40,6 +41,7 @@ api_router.include_router(reminders.router)
 api_router.include_router(audit.router)
 api_router.include_router(dashboard.router)
 api_router.include_router(ldap.router)
+api_router.include_router(dingtalk.router)
 api_router.include_router(notifications.router)
 api_router.include_router(todos.router)
 api_router.include_router(imports.router)

@@ -4,13 +4,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import (
+    DATA_RESOURCE_LABELS,
     DATA_SCOPE_LABELS,
     FIELD_CATALOG,
     SCOPE_PRIORITY,
     SUPER_ADMIN_ROLE,
     DataScope,
+    DomainScope,
 )
-from app.models import Menu, Role, RoleFieldPermission, User
+from app.models import AssetDomain, Menu, Role, RoleFieldPermission, User
 from app.repositories.menu_repo import MenuRepository
 from app.schemas.auth import (
     CurrentUserOut,
@@ -33,9 +35,25 @@ class AuthContext:
     menus: list[MenuNode]
     access_jti: str
     access_exp: int
+    resource_scopes: dict[str, str]
+    resource_custom_dept_ids: dict[str, tuple[int, ...]]
+    domain_scope: str
+    asset_domains: tuple[str, ...]
 
     def has_permission(self, code: str) -> bool:
         return self.is_superuser or code in self.permissions
+
+    def effective_scope(self, resource: str) -> str:
+        return self.resource_scopes.get(resource, self.data_scope)
+
+    def allowed_domains(self, resource: str | None = None) -> tuple[str, ...] | None:
+        """None 仅表示角色被显式授予全部域；空元组表示无任何域权限。"""
+        if self.domain_scope == DomainScope.ALL:
+            return None
+        return self.asset_domains
+
+    def allowed_custom_dept_ids(self, resource: str) -> tuple[int, ...]:
+        return self.resource_custom_dept_ids.get(resource, tuple(self.custom_dept_ids))
 
     def can_view_field(self, resource: str, field_name: str) -> bool:
         if self.is_superuser:
@@ -75,6 +93,9 @@ class AuthContext:
             custom_dept_ids=self.custom_dept_ids,
             menus=self.menus,
             field_permissions=self.field_permissions,
+            domain_scope=self.domain_scope,
+            asset_domains=list(self.asset_domains),
+            resource_scopes=self.resource_scopes,
         )
 
 
@@ -119,6 +140,22 @@ class PermissionService:
             }
         )
         field_permissions = await self._build_field_permissions(roles, is_superuser)
+        resource_scopes, resource_custom_dept_ids = self._resolve_resource_permissions(
+            roles,
+            is_superuser,
+            data_scope,
+            custom_dept_ids,
+        )
+        all_domains = list(
+            (
+                await self.session.execute(
+                    select(AssetDomain).order_by(AssetDomain.sort, AssetDomain.id)
+                )
+            ).scalars().all()
+        )
+        domain_scope, asset_domains = self._resolve_domains(
+            roles, is_superuser, [domain.code for domain in all_domains]
+        )
 
         return AuthContext(
             user=user,
@@ -131,7 +168,77 @@ class PermissionService:
             menus=menus,
             access_jti=access_jti,
             access_exp=access_exp,
+            resource_scopes=resource_scopes,
+            resource_custom_dept_ids=resource_custom_dept_ids,
+            domain_scope=domain_scope,
+            asset_domains=asset_domains,
         )
+
+    @staticmethod
+    def _resolve_domains(
+        roles: list[Role],
+        is_superuser: bool,
+        all_domain_codes: list[str],
+    ) -> tuple[str, tuple[str, ...]]:
+        if is_superuser or any(role.domain_scope == DomainScope.ALL for role in roles):
+            return DomainScope.ALL, tuple(all_domain_codes)
+        domains = sorted(
+            {
+                grant.domain.code
+                for role in roles
+                for grant in role.domain_grants
+            }
+        )
+        return DomainScope.CUSTOM, tuple(domains)
+
+    @staticmethod
+    def _resolve_resource_permissions(
+        roles: list[Role],
+        is_superuser: bool,
+        data_scope: str,
+        custom_dept_ids: list[int],
+    ) -> tuple[dict[str, str], dict[str, tuple[int, ...]]]:
+        """资源级范围：未配置的资源回落全局范围，多角色取最宽范围。"""
+        scopes: dict[str, str] = {}
+        custom_ids: dict[str, tuple[int, ...]] = {}
+        for resource in DATA_RESOURCE_LABELS:
+            if is_superuser:
+                scopes[resource] = DataScope.ALL
+                custom_ids[resource] = ()
+                continue
+            role_scopes: list[str] = []
+            role_custom_ids: set[int] = set()
+            for role in roles:
+                config = next(
+                    (
+                        item
+                        for item in role.data_permissions
+                        if item.resource == resource
+                    ),
+                    None,
+                )
+                role_scope = config.data_scope if config else role.data_scope
+                if role_scope == DataScope.ROLE:
+                    role_scope = DataScope.SELF
+                role_scopes.append(role_scope)
+                if role_scope == DataScope.CUSTOM:
+                    if config is not None:
+                        role_custom_ids.update(config.dept_ids or [])
+                    else:
+                        role_custom_ids.update(dept.id for dept in role.depts)
+            scope = data_scope
+            if role_scopes:
+                for candidate in SCOPE_PRIORITY:
+                    if candidate == DataScope.ROLE:
+                        continue
+                    if candidate in role_scopes:
+                        scope = candidate
+                        break
+            scopes[resource] = scope
+            custom_ids[resource] = (
+                tuple(sorted(role_custom_ids)) if scope == DataScope.CUSTOM else ()
+            )
+        return scopes, custom_ids
 
     @staticmethod
     def _resolve_data_scope(roles: list[Role], is_superuser: bool) -> str:
@@ -139,6 +246,9 @@ class PermissionService:
             return DataScope.ALL
         scope_set = {role.data_scope for role in roles}
         for scope in SCOPE_PRIORITY:
+            if scope == DataScope.ROLE:
+                # 全局范围不支持按创建人限定，避免被误当作「不限部门」
+                continue
             if scope in scope_set:
                 return scope
         return DataScope.SELF

@@ -2,7 +2,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import BizError, ConflictError, NotFoundError, PermissionDenied
-from app.core.permissions import DataScope, SUPER_ADMIN_ROLE
+from app.core.permissions import DataScope, DomainScope, SUPER_ADMIN_ROLE
 from app.core.security import hash_password
 from app.models import Dept, Role, User
 from app.models.base import now_cst
@@ -122,10 +122,12 @@ class UserAdminService:
         include_child: bool = True,
         status: int | None = None,
         role_id: int | None = None,
+        source: str | None = None,
     ) -> UserPageOut:
         allowed = await scoped_dept_ids(self.session, context)
-        dept_ids = allowed
-        if dept_id is not None:
+        self_only = is_self_only(context)
+        dept_ids = None if self_only else allowed
+        if dept_id is not None and not self_only:
             subtree_ids = await self._dept_subtree_ids(dept_id, include_child)
             dept_ids = subtree_ids if allowed is None else (subtree_ids & allowed)
 
@@ -136,6 +138,7 @@ class UserAdminService:
             dept_ids=dept_ids,
             status=status,
             role_id=role_id,
+            source=source,
             self_user_id=context.user.id if is_self_only(context) else None,
         )
         dept_paths = await _dept_path_lookup(self.session)
@@ -163,6 +166,11 @@ class UserAdminService:
         return _serialize_detail(user, await _dept_path_lookup(self.session))
 
     async def create_user(self, payload: UserCreate, context: AuthContext) -> UserDetailOut:
+        if is_self_only(context):
+            raise PermissionDenied("仅本人数据范围不能创建其他用户")
+        allowed = await scoped_dept_ids(self.session, context)
+        if allowed is not None and payload.dept_id not in allowed:
+            raise PermissionDenied("无权在该部门创建用户")
         dept = await self._assert_dept_active(payload.dept_id)
         roles = await self._load_roles(payload.role_ids)
         self._assert_roles_grantable(roles, context)
@@ -218,12 +226,20 @@ class UserAdminService:
             raise ConflictError("用户信息已被他人修改，请刷新后重试")
         await self._assert_manage_target(user, context)
         await self._assert_visible(user, context)
+        if user.source != "local" and not context.is_superuser:
+            raise PermissionDenied("外部来源用户由同步任务维护，仅超级管理员可修改")
 
         if user.id == context.user.id and payload.role_ids is not None:
             current_role_ids = {role.id for role in user.roles}
             if set(payload.role_ids) != current_role_ids:
                 raise BizError("不能修改自己的角色，请联系其他管理员操作")
 
+        if payload.dept_id != user.dept_id:
+            if is_self_only(context):
+                raise PermissionDenied("仅本人数据范围不能调整自己的所属部门")
+            allowed = await scoped_dept_ids(self.session, context)
+            if allowed is not None and payload.dept_id not in allowed:
+                raise PermissionDenied("无权将用户调整到该部门")
         dept = await self._assert_dept_assignment(user, payload.dept_id)
         conflict = await self.users.find_conflict(
             username=user.username,
@@ -282,6 +298,8 @@ class UserAdminService:
             raise ConflictError("用户信息已被他人修改，请刷新后重试")
         await self._assert_manage_target(user, context)
         await self._assert_visible(user, context)
+        if user.source != "local" and not context.is_superuser:
+            raise PermissionDenied("外部来源用户由同步任务维护，仅超级管理员可修改")
         if user.id == context.user.id and payload.status == 0:
             raise BizError("不能停用当前登录账号")
 
@@ -348,6 +366,8 @@ class UserAdminService:
             raise BizError("不能删除当前登录账号")
         await self._assert_manage_target(user, context)
         await self._assert_visible(user, context)
+        if user.source != "local" and not context.is_superuser:
+            raise PermissionDenied("外部来源用户由同步任务维护，仅超级管理员可删除")
         if self._is_super_admin(user):
             await self._assert_last_super_admin(user)
 
@@ -410,6 +430,14 @@ class UserAdminService:
                 raise PermissionDenied(f"角色「{role.name}」超出当前账号可授予的权限范围")
             if role.data_scope == DataScope.ALL and context.data_scope != DataScope.ALL:
                 raise PermissionDenied(f"角色「{role.name}」的数据范围超出当前账号")
+            if context.data_scope == DataScope.SELF and role.data_scope != DataScope.SELF:
+                raise PermissionDenied(f"角色「{role.name}」的数据范围超出当前账号")
+            if context.domain_scope != DomainScope.ALL:
+                if role.domain_scope == DomainScope.ALL:
+                    raise PermissionDenied(f"角色「{role.name}」的资产域超出当前账号")
+                role_domains = {grant.domain.code for grant in role.domain_grants}
+                if not role_domains.issubset(context.asset_domains):
+                    raise PermissionDenied(f"角色「{role.name}」的资产域超出当前账号")
 
     async def _assert_manage_target(self, user: User, context: AuthContext) -> None:
         if self._is_super_admin(user) and not context.is_superuser:

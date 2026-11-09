@@ -1,3 +1,6 @@
+/** 角色级资产域范围：ALL=显式全部域；CUSTOM+空数组=无资产域权限（不是不限）。 */
+export type DomainScope = 'ALL' | 'CUSTOM'
+
 export interface RoleItem {
   id: number
   code: string
@@ -5,6 +8,8 @@ export interface RoleItem {
   description: string | null
   data_scope: string
   data_scope_label: string
+  domain_scope: DomainScope
+  asset_domains: string[]
   status: number
   sort: number
   is_system: boolean
@@ -46,14 +51,26 @@ export interface FieldPermissionItem {
   can_edit: boolean
 }
 
+export interface ResourceDataPermissionItem {
+  resource: string
+  data_scope: string
+  dept_ids: number[]
+}
+
 export interface RoleDetail extends RoleItem {
   menu_ids: number[]
   dept_ids: number[]
   field_permissions: FieldPermissionItem[]
+  data_permissions: ResourceDataPermissionItem[]
   users: RoleMember[]
 }
 
 export interface DataScopeOption {
+  value: string
+  label: string
+}
+
+export interface ResourceOption {
   value: string
   label: string
 }
@@ -65,6 +82,8 @@ export interface FieldDefinition {
 
 export interface RoleMeta {
   data_scopes: DataScopeOption[]
+  data_resources: ResourceOption[]
+  asset_domains: DataScopeOption[]
   field_catalog: Record<string, FieldDefinition[]>
 }
 
@@ -95,6 +114,8 @@ export interface RoleCreatePayload {
   name: string
   description?: string | null
   data_scope: string
+  domain_scope: DomainScope
+  asset_domains: string[]
   sort: number
   status: number
 }
@@ -112,8 +133,11 @@ export interface MenuAssignPayload {
   version: number
 }
 
-export interface DataScopeAssignPayload {
+export interface DataPermissionsAssignPayload {
   data_scope: string
+  domain_scope: DomainScope
+  asset_domains: string[]
+  permissions: ResourceDataPermissionItem[]
   dept_ids: number[]
   version: number
 }
