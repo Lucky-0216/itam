@@ -1,11 +1,12 @@
 from httpx import AsyncClient
-from sqlalchemy import insert, select
+from sqlalchemy import insert, select, update
 
+from app.core.asset_flow import RequestStatus, RequestType
 from app.core.assets import AssetStatus
 from app.core.database import AsyncSessionLocal
 from app.core.security import hash_password
 from app.initial_data import seed_initial_data
-from app.models import Asset, Dept, Role, User, user_roles
+from app.models import Asset, AssetRequest, Dept, Role, User, user_roles
 from tests.helpers import auth_headers, login
 
 TEST_PASSWORD = "Test@12345"
@@ -617,6 +618,117 @@ async def test_admin_domain_role_only_sees_admin_assets(client: AsyncClient):
         headers=user_headers,
     )
     assert asset_create_allowed.status_code == 200, asset_create_allowed.text
+
+
+async def test_personal_views_ignore_asset_domain(client: AsyncClient):
+    admin_headers = auth_headers((await login(client))["access_token"])
+    menus = await _menu_map(client, admin_headers)
+    it_category = await _category(client, admin_headers, "HW-LAPTOP")
+    admin_category = await _category(client, admin_headers, "ADM-FURNITURE")
+    dept = await _it_dept(client, admin_headers)
+
+    role = await _create_role(
+        client,
+        admin_headers,
+        code="PERSONAL_DOMAIN_VIEWER",
+        menus=menus,
+        permission_codes=[
+            "asset:ledger:view",
+            "asset:mine:view",
+            "asset:requisition:view",
+        ],
+    )
+    scoped = await client.put(
+        f"/api/v1/roles/{role['id']}/data-permissions",
+        json={
+            "data_scope": "ALL",
+            "domain_scope": "CUSTOM",
+            "asset_domains": ["ADMIN"],
+            "permissions": [],
+            "dept_ids": [],
+            "version": role["version"],
+        },
+        headers=admin_headers,
+    )
+    assert scoped.status_code == 200, scoped.text
+
+    user_id = await _create_user("personal_domain_user", role["id"])
+    user_headers = await _login_user(client, "personal_domain_user")
+
+    it_asset = await _create_asset(
+        client,
+        admin_headers,
+        name="个人视图-IT-资产",
+        category_id=it_category["id"],
+        dept_id=dept["id"],
+        custodian_id=user_id,
+    )
+    admin_asset = await _create_asset(
+        client,
+        admin_headers,
+        name="个人视图-行政-资产",
+        category_id=admin_category["id"],
+        dept_id=dept["id"],
+        custodian_id=user_id,
+    )
+    async with AsyncSessionLocal() as session:
+        await session.execute(
+            update(Asset)
+            .where(Asset.id.in_([it_asset["id"], admin_asset["id"]]))
+            .values(status=AssetStatus.IN_USE)
+        )
+        await session.commit()
+
+    mine = await client.get("/api/v1/my-assets", headers=user_headers)
+    assert mine.status_code == 200, mine.text
+    assert {item["asset_id"] for item in mine.json()["data"]} == {
+        it_asset["id"],
+        admin_asset["id"],
+    }
+
+    # 生命周期台账仍按资产域限制。
+    ledger = await client.get(
+        "/api/v1/assets", params={"keyword": "个人视图"}, headers=user_headers
+    )
+    assert ledger.status_code == 200, ledger.text
+    assert {item["id"] for item in ledger.json()["data"]["items"]} == {
+        admin_asset["id"]
+    }
+
+    history = await client.get(
+        f"/api/v1/assets/{it_asset['id']}/history", headers=user_headers
+    )
+    assert history.status_code == 200, history.text
+
+    async with AsyncSessionLocal() as session:
+        request = AssetRequest(
+            request_no="LY-PERSONAL-DOMAIN-1",
+            request_type=RequestType.REQUISITION,
+            status=RequestStatus.PENDING_APPROVAL,
+            category_id=it_category["id"],
+            category_name=it_category["name"],
+            applicant_id=user_id,
+            applicant_name="personal_domain_user",
+            applicant_dept_id=dept["id"],
+            applicant_dept_name=dept["name"],
+        )
+        session.add(request)
+        await session.flush()
+        request_id = request.id
+        await session.commit()
+
+    my_requests = await client.get(
+        "/api/v1/asset-requests/mine", headers=user_headers
+    )
+    assert my_requests.status_code == 200, my_requests.text
+    assert [item["id"] for item in my_requests.json()["data"]["items"]] == [
+        request_id
+    ]
+
+    request_detail = await client.get(
+        f"/api/v1/asset-requests/{request_id}", headers=user_headers
+    )
+    assert request_detail.status_code == 200, request_detail.text
 
 
 async def test_self_scope_does_not_share_role_member_data(client: AsyncClient):
@@ -1324,7 +1436,9 @@ async def test_masked_fields_hidden_across_search_stock_and_reports(
     assert all(item["value"] == 0.0 for item in overview_data["purchase_trend"])
 
     # 驾驶舱总金额与最近资产名称同样受字段权限约束。
-    dashboard = await client.get("/api/v1/dashboard/summary", headers=headers)
+    dashboard = await client.get(
+        "/api/v1/dashboard/summary?scope=org", headers=headers
+    )
     assert dashboard.status_code == 200, dashboard.text
     dashboard_data = dashboard.json()["data"]
     assert dashboard_data["metrics"]["total_assets"] >= 1
@@ -1333,6 +1447,88 @@ async def test_masked_fields_hidden_across_search_stock_and_reports(
         item for item in dashboard_data["recent_assets"] if item["id"] == asset["id"]
     )
     assert recent["name"] == "已隐藏"
+
+
+async def test_custom_domain_not_widened_by_all_domain_role(
+    client: AsyncClient,
+):
+    admin_headers = auth_headers((await login(client))["access_token"])
+    menus = await _menu_map(client, admin_headers)
+    it_category = await _category(client, admin_headers, "HW-LAPTOP")
+    admin_category = await _category(client, admin_headers, "ADM-FURNITURE")
+    dept = await _it_dept(client, admin_headers)
+
+    it_asset = await _create_asset(
+        client,
+        admin_headers,
+        name="混合角色-IT-资产",
+        category_id=it_category["id"],
+        dept_id=dept["id"],
+    )
+    admin_asset = await _create_asset(
+        client,
+        admin_headers,
+        name="混合角色-行政-资产",
+        category_id=admin_category["id"],
+        dept_id=dept["id"],
+    )
+
+    async with AsyncSessionLocal() as session:
+        employee = (
+            await session.execute(select(Role).where(Role.code == "EMPLOYEE"))
+        ).scalar_one()
+
+    role = await _create_role(
+        client,
+        admin_headers,
+        code="MIXED_DOMAIN_OPERATOR",
+        menus=menus,
+        permission_codes=["asset:ledger:view", "asset:category:view"],
+        data_scope="ALL",
+        domain_scope="CUSTOM",
+        asset_domains=["ADMIN"],
+    )
+
+    # 默认角色（全部资产域）+ 指定资产域角色：以指定域为准。
+    user_id = await _create_user("mixed_domain_user", employee.id)
+    async with AsyncSessionLocal() as session:
+        await session.execute(
+            insert(user_roles).values(user_id=user_id, role_id=role["id"])
+        )
+        await session.commit()
+
+    headers = await _login_user(client, "mixed_domain_user")
+    me = await client.get("/api/v1/auth/me", headers=headers)
+    assert me.status_code == 200, me.text
+    me_body = me.json()["data"]
+    assert {item["code"] for item in me_body["roles"]} == {
+        "EMPLOYEE",
+        "MIXED_DOMAIN_OPERATOR",
+    }
+    assert me_body["domain_scope"] == "CUSTOM"
+    assert me_body["asset_domains"] == ["ADMIN"]
+
+    tree = await client.get("/api/v1/asset-categories/tree", headers=headers)
+    assert tree.status_code == 200, tree.text
+    categories = _flatten_categories(tree.json()["data"])
+    assert categories
+    assert {item["asset_domain"] for item in categories} == {"ADMIN"}
+
+    ledger = await client.get(
+        "/api/v1/assets", params={"page_size": 200}, headers=headers
+    )
+    assert ledger.status_code == 200, ledger.text
+    visible_ids = {item["id"] for item in ledger.json()["data"]["items"]}
+    assert admin_asset["id"] in visible_ids
+    assert it_asset["id"] not in visible_ids
+
+    # 只有默认角色的用户不受资产域限制。
+    await _create_user("employee_only_user", employee.id)
+    employee_headers = await _login_user(client, "employee_only_user")
+    employee_me = await client.get("/api/v1/auth/me", headers=employee_headers)
+    assert employee_me.status_code == 200, employee_me.text
+    assert employee_me.json()["data"]["domain_scope"] == "ALL"
+    assert set(employee_me.json()["data"]["asset_domains"]) == {"ADMIN", "IT"}
 
 
 async def test_builtin_roles_are_superuser_only(client: AsyncClient):

@@ -943,7 +943,7 @@ onMounted(async () => {
 
 .summary-card.active {
   border-color: var(--brand);
-  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+  box-shadow: 0 0 0 3px var(--brand-soft);
 }
 
 .summary-card span,

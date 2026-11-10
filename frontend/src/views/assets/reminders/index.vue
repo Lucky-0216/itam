@@ -593,7 +593,7 @@ onMounted(() => {
   padding: 24px 26px;
   margin-bottom: 16px;
   background:
-    radial-gradient(520px 220px at 88% 10%, rgba(37, 99, 235, 0.1), transparent 62%),
+    radial-gradient(520px 220px at 88% 10%, color-mix(in srgb, var(--brand) 10%, transparent), transparent 62%),
     var(--surface);
 }
 
@@ -652,7 +652,7 @@ onMounted(() => {
 .orbit-ring {
   position: absolute;
   inset: 0;
-  border: 1px dashed rgba(37, 99, 235, 0.3);
+  border: 1px dashed color-mix(in srgb, var(--brand) 30%, transparent);
   border-radius: 50%;
   animation: orbit-spin 18s linear infinite;
 }
@@ -667,7 +667,7 @@ onMounted(() => {
   margin-left: -4px;
   border-radius: 50%;
   background: var(--brand);
-  box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.14);
+  box-shadow: 0 0 0 4px var(--brand-soft);
 }
 
 .orbit-core {
@@ -677,8 +677,8 @@ onMounted(() => {
   height: 66px;
   border-radius: 50%;
   background: var(--gradient-brand);
-  color: #fff;
-  box-shadow: 0 12px 26px rgba(37, 99, 235, 0.28);
+  color: var(--on-brand);
+  box-shadow: 0 12px 26px var(--brand-glow);
 }
 
 .orbit-core .el-icon {
@@ -723,7 +723,7 @@ onMounted(() => {
 .level-chip.active {
   border-color: var(--brand);
   background: var(--surface);
-  box-shadow: 0 6px 18px rgba(37, 99, 235, 0.12);
+  box-shadow: 0 6px 18px -10px var(--brand-glow);
 }
 
 .level-dot {
@@ -784,7 +784,7 @@ onMounted(() => {
 
 .category-card.active {
   border-color: var(--brand);
-  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+  box-shadow: 0 0 0 3px var(--brand-soft);
 }
 
 .category-icon {
@@ -794,8 +794,8 @@ onMounted(() => {
   height: 40px;
   flex-shrink: 0;
   border-radius: 12px;
-  background: rgba(37, 99, 235, 0.1);
-  color: #2563eb;
+  background: var(--brand-soft);
+  color: var(--brand);
 }
 
 .category-icon .el-icon {
@@ -960,8 +960,8 @@ onMounted(() => {
   width: 24px;
   height: 24px;
   border-radius: 8px;
-  background: rgba(37, 99, 235, 0.1);
-  color: #2563eb;
+  background: var(--brand-soft);
+  color: var(--brand);
   font-size: 13px;
 }
 

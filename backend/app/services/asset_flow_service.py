@@ -39,6 +39,7 @@ from app.models import (
     AssetScrap,
     AssetTransfer,
     AuditLog,
+    User,
 )
 from app.models.base import now_cst
 from app.schemas.asset_flow import (
@@ -55,6 +56,11 @@ from app.schemas.asset_flow import (
     AvailableAssetOut,
     AvailableCategoryOut,
     AvailableModelOut,
+    DirectCategoryOut,
+    DirectOutboundItemOut,
+    DirectOutboundPayload,
+    DirectOutboundResultOut,
+    DirectUserOut,
     MyAssetOut,
     ScanAssetOut,
 )
@@ -486,13 +492,14 @@ class AssetFlowService:
     ) -> AssetRequestPageOut:
         conditions = []
         allowed: set[int] | None = None
-        domain_condition = self._domain_condition(context)
-        if domain_condition is not None:
-            conditions.append(domain_condition)
 
         if view == "mine":
+            # 我的申请属于个人数据，不受资产域限制。
             conditions.append(AssetRequest.applicant_id == context.user.id)
         else:
+            domain_condition = self._domain_condition(context)
+            if domain_condition is not None:
+                conditions.append(domain_condition)
             allowed = await self._allowed_depts(context)
             if is_self_only(context, "requisition"):
                 conditions.append(
@@ -1022,14 +1029,12 @@ class AssetFlowService:
         )
 
     async def my_assets(self, context: AuthContext) -> list[MyAssetOut]:
+        # 我的资产属于个人数据，不受资产域限制；资产域只作用于生命周期视图。
         conditions = [
             Asset.deleted_at.is_(None),
             Asset.custodian_id == context.user.id,
             Asset.status.in_((AssetStatus.IN_USE, AssetStatus.BORROWED)),
         ]
-        domain_condition = asset_domain_condition(context, "requisition")
-        if domain_condition is not None:
-            conditions.append(domain_condition)
         assets = list(
             (
                 await self.session.execute(
@@ -1816,14 +1821,417 @@ class AssetFlowService:
         await commit_or_conflict(self.session, message=STATUS_CONFLICT_MESSAGE)
         return self._request_out(request, context, allowed)
 
+    async def direct_category_options(
+        self, context: AuthContext
+    ) -> list[DirectCategoryOut]:
+        categories = list(
+            (
+                await self.session.execute(
+                    select(AssetCategory).order_by(
+                        AssetCategory.sort, AssetCategory.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        by_id = {category.id: category for category in categories}
+        domains = context.allowed_domains("requisition")
+
+        def full_name(category: AssetCategory) -> str:
+            names: list[str] = []
+            node: AssetCategory | None = category
+            while node is not None:
+                names.append(node.name)
+                node = by_id.get(node.parent_id) if node.parent_id else None
+            return " / ".join(reversed(names))
+
+        return [
+            DirectCategoryOut(
+                id=category.id,
+                name=category.name,
+                full_name=full_name(category),
+            )
+            for category in categories
+            if category.status == 1
+            and (domains is None or category.asset_domain in domains)
+        ]
+
+    async def _direct_asset_conditions(
+        self,
+        context: AuthContext,
+        *,
+        keyword: str | None,
+        category_id: int | None,
+        include_child: bool,
+    ) -> list:
+        conditions = [
+            *self._available_conditions(context),
+            Asset.id.notin_(
+                select(AssetRequest.asset_id).where(
+                    AssetRequest.asset_id.is_not(None),
+                    AssetRequest.status.in_(ACTIVE_REQUEST_STATUSES),
+                )
+            ),
+            Asset.id.notin_(
+                select(AssetTransfer.asset_id).where(
+                    AssetTransfer.status.in_(TRANSFER_ACTIVE_STATUSES)
+                )
+            ),
+            Asset.id.notin_(
+                select(AssetScrap.asset_id).where(
+                    AssetScrap.status.in_(SCRAP_ACTIVE_STATUSES)
+                )
+            ),
+        ]
+        if category_id is not None:
+            category = await self._get_available_category(category_id, context)
+            conditions.extend(self._category_conditions(category, include_child))
+        if keyword:
+            pattern = f"%{keyword.strip()}%"
+            conditions.append(
+                or_(
+                    Asset.asset_no.like(pattern),
+                    Asset.name.like(pattern),
+                    Asset.serial_no.like(pattern),
+                    Asset.category_id.in_(
+                        select(AssetCategory.id).where(
+                            AssetCategory.name.like(pattern)
+                        )
+                    ),
+                    Asset.model_id.in_(
+                        select(AssetModel.id).where(
+                            or_(
+                                AssetModel.name.like(pattern),
+                                AssetModel.code.like(pattern),
+                            )
+                        )
+                    ),
+                )
+            )
+        return conditions
+
+    async def direct_assets(
+        self,
+        context: AuthContext,
+        *,
+        keyword: str | None,
+        category_id: int | None,
+        include_child: bool,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[AvailableAssetOut], int]:
+        conditions = await self._direct_asset_conditions(
+            context,
+            keyword=keyword,
+            category_id=category_id,
+            include_child=include_child,
+        )
+        total = int(
+            await self.session.scalar(
+                select(func.count()).select_from(Asset).where(*conditions)
+            )
+            or 0
+        )
+        rows = list(
+            (
+                await self.session.execute(
+                    select(Asset)
+                    .where(*conditions)
+                    .order_by(Asset.asset_no.asc(), Asset.id.asc())
+                    .offset((page - 1) * page_size)
+                    .limit(page_size)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return [self._available_out(asset) for asset in rows], total
+
+    async def direct_user_options(
+        self,
+        context: AuthContext,
+        *,
+        keyword: str | None = None,
+        limit: int = 50,
+    ) -> list[DirectUserOut]:
+        conditions = [User.deleted_at.is_(None), User.status == 1]
+        if keyword:
+            pattern = f"%{keyword.strip()}%"
+            conditions.append(
+                or_(
+                    User.username.like(pattern),
+                    User.real_name.like(pattern),
+                    User.employee_no.like(pattern),
+                    User.phone.like(pattern),
+                )
+            )
+        rows = list(
+            (
+                await self.session.execute(
+                    select(User)
+                    .where(*conditions)
+                    .order_by(User.real_name.asc(), User.id.asc())
+                    .limit(limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return [
+            DirectUserOut(
+                id=user.id,
+                username=user.username,
+                real_name=user.real_name,
+                dept_name=user.dept.name if user.dept else None,
+                status=user.status,
+            )
+            for user in rows
+        ]
+
+    async def _assert_asset_outbound_ready(self, asset: Asset) -> None:
+        active_transfer = await self.session.scalar(
+            select(AssetTransfer.id)
+            .where(
+                AssetTransfer.asset_id == asset.id,
+                AssetTransfer.status.in_(TRANSFER_ACTIVE_STATUSES),
+            )
+            .limit(1)
+        )
+        if active_transfer:
+            raise ConflictError(
+                f"资产 {asset.asset_no} 存在处理中的调拨单，请刷新后重试",
+                code=40911,
+            )
+        active_scrap = await self.session.scalar(
+            select(AssetScrap.id)
+            .where(
+                AssetScrap.asset_id == asset.id,
+                AssetScrap.status.in_(SCRAP_ACTIVE_STATUSES),
+            )
+            .limit(1)
+        )
+        if active_scrap:
+            raise ConflictError(
+                f"资产 {asset.asset_no} 存在处理中的报废单，请刷新后重试",
+                code=40911,
+            )
+        active_maintenance = await self.session.scalar(
+            select(AssetMaintenance.id)
+            .where(
+                AssetMaintenance.asset_id == asset.id,
+                AssetMaintenance.status.in_(MAINTENANCE_ACTIVE_STATUSES),
+            )
+            .limit(1)
+        )
+        if active_maintenance:
+            raise ConflictError(
+                f"资产 {asset.asset_no} 存在处理中的维修工单，请刷新后重试",
+                code=40911,
+            )
+        other = await self._find_active_request(asset.id)
+        if other is not None:
+            raise ConflictError(
+                f"资产 {asset.asset_no} 存在进行中的业务单据，请刷新后重试",
+                code=40911,
+            )
+
+    async def direct_outbound(
+        self,
+        payload: DirectOutboundPayload,
+        context: AuthContext,
+    ) -> DirectOutboundResultOut:
+        target = (
+            await self.session.execute(
+                select(User).where(
+                    User.id == payload.user_id,
+                    User.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if target is None:
+            raise NotFoundError("目标领用人不存在")
+        if target.status != 1:
+            raise BizError("目标领用人已停用，请重新选择")
+
+        now = now_cst()
+        if payload.request_type == RequestType.BORROW:
+            if payload.expected_return_date is None:
+                raise BizError("借用出库必须填写预计归还日期")
+            if payload.expected_return_date < now.date():
+                raise BizError("预计归还日期不能早于今天")
+
+        borrow_head = ""
+        borrow_seq = 0
+        if payload.request_type == RequestType.BORROW:
+            borrow_head = (
+                f"{REQUEST_NO_PREFIXES[RequestType.BORROW]}-{now:%Y%m}-"
+            )
+            max_no = await self.session.scalar(
+                select(func.max(AssetRequest.request_no)).where(
+                    AssetRequest.request_no.like(f"{borrow_head}%")
+                )
+            )
+            borrow_seq = 1
+            if max_no:
+                suffix = max_no[len(borrow_head) :]
+                if suffix.isdigit():
+                    borrow_seq = int(suffix) + 1
+
+        target_status = (
+            AssetStatus.IN_USE
+            if payload.request_type == RequestType.REQUISITION
+            else AssetStatus.BORROWED
+        )
+        module = (
+            "资产领用"
+            if payload.request_type == RequestType.REQUISITION
+            else "资产借用"
+        )
+        type_label = REQUEST_TYPE_LABELS[payload.request_type]
+        results: list[DirectOutboundItemOut] = []
+
+        for item in payload.items:
+            asset = await self._get_asset(item.asset_id, for_update=True)
+            if not category_domain_allowed(asset.category, context, "requisition"):
+                raise PermissionDenied("无权出库该资产域下的资产")
+            if item.version != asset.version:
+                raise ConflictError(STATUS_CONFLICT_MESSAGE, code=40911)
+            if asset.status != AssetStatus.IN_STOCK:
+                raise ConflictError(
+                    f"资产 {asset.asset_no} 当前不在库，请刷新后重试",
+                    code=40911,
+                )
+            await self._assert_asset_outbound_ready(asset)
+
+            before = _asset_snapshot(asset)
+            asset.status = target_status
+            asset.custodian_id = target.id
+            asset.custodian = target
+            asset.dept_id = target.dept_id
+            asset.dept = target.dept
+            if payload.location:
+                asset.location = payload.location
+            after = _asset_snapshot(asset)
+            after["outbound_type"] = payload.request_type
+            after["direct_outbound"] = True
+            after["reason"] = payload.reason
+            after["request_no"] = None
+
+            request: AssetRequest | None = None
+            if payload.request_type == RequestType.BORROW:
+                # 借用需要可归还的时间线：生成已出库的借用单据，
+                # 复用归还确认、到期提醒与“我的资产”展示。
+                assert_transition(
+                    RequestType.BORROW,
+                    RequestStatus.PENDING_OUTBOUND,
+                    RequestStatus.BORROWED,
+                )
+                request = AssetRequest(
+                    request_no=f"{borrow_head}{borrow_seq:04d}",
+                    request_type=RequestType.BORROW,
+                    status=RequestStatus.BORROWED,
+                    category_id=asset.category_id,
+                    category_name=(
+                        asset.category.name if asset.category else ""
+                    ),
+                    include_child=False,
+                    asset_id=asset.id,
+                    asset_no=asset.asset_no,
+                    asset_name=asset.name,
+                    asset_version=asset.version,
+                    applicant_id=target.id,
+                    applicant_name=target.real_name,
+                    applicant_dept_id=target.dept_id,
+                    applicant_dept_name=(
+                        target.dept.name if target.dept else None
+                    ),
+                    reason=payload.reason,
+                    expected_return_date=payload.expected_return_date,
+                    approver_id=context.user.id,
+                    approver_name=context.user.real_name,
+                    approved_at=now,
+                    approval_comment="管理员直接出库",
+                    outbound_by_id=context.user.id,
+                    outbound_by_name=context.user.real_name,
+                    outbound_at=now,
+                    outbound_location=payload.location or asset.location,
+                    confirm_comment=payload.comment,
+                )
+                borrow_seq += 1
+                self.session.add(request)
+                await self.session.flush()
+                request.asset = asset
+                after["request_no"] = request.request_no
+                after["expected_return_date"] = _json_value(
+                    payload.expected_return_date
+                )
+
+            self.session.add(
+                AssetHistory(
+                    asset_id=asset.id,
+                    request_id=request.id if request is not None else None,
+                    action=AssetHistoryAction.OUTBOUND,
+                    action_label=ASSET_HISTORY_ACTION_LABELS[
+                        AssetHistoryAction.OUTBOUND
+                    ],
+                    from_status=before["status"],
+                    to_status=after["status"],
+                    before_snapshot=before,
+                    after_snapshot=after,
+                    operator_id=context.user.id,
+                    operator_name=context.user.real_name,
+                    summary=(
+                        f"管理员直接{type_label}出库给 {target.real_name}："
+                        f"{payload.reason}"
+                    ),
+                )
+            )
+            await self.audit.record(
+                action="asset.outbound.direct",
+                module=module,
+                summary=(
+                    f"直接出库：{asset.asset_no} {asset.name} → "
+                    f"{target.real_name}（{type_label}）"
+                ),
+                actor=context.user,
+                resource_type="asset",
+                resource_id=asset.id,
+                before=before,
+                after=after,
+            )
+            results.append(
+                DirectOutboundItemOut(
+                    asset_id=asset.id,
+                    asset_no=asset.asset_no,
+                    name=asset.name,
+                    status=asset.status,
+                    status_label=ASSET_STATUS_LABELS.get(
+                        asset.status, asset.status
+                    ),
+                    custodian_id=target.id,
+                    custodian_name=target.real_name,
+                    request_id=request.id if request is not None else None,
+                )
+            )
+
+        await commit_or_conflict(self.session, message=STATUS_CONFLICT_MESSAGE)
+        return DirectOutboundResultOut(
+            user_id=target.id,
+            user_name=target.real_name,
+            request_type=payload.request_type,
+            request_type_label=type_label,
+            count=len(results),
+            items=results,
+        )
+
     async def create_return(
         self,
         payload: AssetReturnCreate,
         context: AuthContext,
     ) -> AssetRequestOut:
         asset = await self._get_asset(payload.asset_id, for_update=True)
-        if not category_domain_allowed(asset.category, context, "requisition"):
-            raise PermissionDenied("无权操作该分类下的资产")
+        # 归还本人名下资产属于个人操作，不受资产域限制。
         if asset.status not in (AssetStatus.IN_USE, AssetStatus.BORROWED):
             raise BizError("当前资产不在用，无需归还")
         if asset.custodian_id != context.user.id:
@@ -1984,17 +2392,17 @@ class AssetFlowService:
     async def get_request(self, request_id: int, context: AuthContext) -> AssetRequestOut:
         request = await self._get_request(request_id)
         allowed = await self._allowed_depts(context)
-        if not context.is_superuser:
+        # 本人单据属于个人数据，不受资产域限制；管理/审批视角仍按域校验。
+        if not context.is_superuser and request.applicant_id != context.user.id:
             if not self._in_domain(request, context):
                 raise PermissionDenied("无权查看该资产域下的业务单据")
-            if request.applicant_id != context.user.id:
-                is_task_approver = bool(request.flow_id) and (
-                    ApprovalFlowService.has_task_for_user(request, context.user.id)
-                )
-                if not is_task_approver:
-                    if not self._can_read_review(context):
-                        raise PermissionDenied("无权查看该业务单据")
-                    self._assert_review_scope(request, context, allowed)
+            is_task_approver = bool(request.flow_id) and (
+                ApprovalFlowService.has_task_for_user(request, context.user.id)
+            )
+            if not is_task_approver:
+                if not self._can_read_review(context):
+                    raise PermissionDenied("无权查看该业务单据")
+                self._assert_review_scope(request, context, allowed)
         return self._request_out(request, context, allowed)
 
     async def scan(self, code: str, context: AuthContext) -> ScanAssetOut:
@@ -2017,6 +2425,22 @@ class AssetFlowService:
                 .limit(1)
             )
         ).scalar_one_or_none()
+        if asset is None:
+            # 扫码查看本人名下资产属于个人场景，不受资产域限制。
+            asset = (
+                await self.session.execute(
+                    select(Asset)
+                    .where(
+                        Asset.deleted_at.is_(None),
+                        Asset.custodian_id == context.user.id,
+                        or_(
+                            Asset.asset_no == normalized,
+                            Asset.serial_no == normalized,
+                        ),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
         if asset is None:
             raise NotFoundError("未找到匹配的资产，请检查二维码或资产编号")
         allowed = await self._allowed_depts(context)
@@ -2061,13 +2485,15 @@ class AssetFlowService:
         asset = await self._get_asset(asset_id, include_deleted=True)
         allowed = await scoped_dept_ids(self.session, context, resource="asset")
         if not context.is_superuser:
-            if not category_domain_allowed(asset.category, context, "asset"):
-                raise NotFoundError("资产不存在或无权访问")
-            if is_self_only(context, "asset"):
-                if context.user.id not in (asset.custodian_id, asset.created_by_id):
+            # 本人名下/本人创建的资产属于个人数据，不受资产域和部门范围限制。
+            is_owner = context.user.id in (asset.custodian_id, asset.created_by_id)
+            if not is_owner:
+                if not category_domain_allowed(asset.category, context, "asset"):
                     raise NotFoundError("资产不存在或无权访问")
-            elif allowed is not None and asset.dept_id not in allowed:
-                raise NotFoundError("资产不存在或无权访问")
+                if is_self_only(context, "asset"):
+                    raise NotFoundError("资产不存在或无权访问")
+                if allowed is not None and asset.dept_id not in allowed:
+                    raise NotFoundError("资产不存在或无权访问")
 
         rows = list(
             (

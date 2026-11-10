@@ -2,7 +2,7 @@ from sqlalchemy import insert, select
 
 from app.core.database import AsyncSessionLocal
 from app.core.security import hash_password
-from app.models import Role, User, user_roles
+from app.models import AuditLog, Dept, Role, User, user_roles
 from tests.helpers import auth_headers, login
 
 
@@ -111,6 +111,53 @@ async def test_audit_log_list_filter_detail(client):
 
     missing = await client.get("/api/v1/audit-logs/999999", headers=headers)
     assert missing.status_code == 404
+
+
+async def test_audit_detail_resolves_reference_labels(client):
+    tokens = await login(client)
+    headers = auth_headers(tokens["access_token"])
+
+    async with AsyncSessionLocal() as session:
+        admin = (
+            await session.execute(select(User).where(User.username == "admin"))
+        ).scalar_one()
+        target = User(
+            username="labeluser01",
+            password_hash=hash_password("Test@12345"),
+            real_name="标签用户",
+            status=1,
+            must_change_password=False,
+        )
+        dept = Dept(name="标签部门", code="LABEL-DEPT-01")
+        session.add_all([target, dept])
+        await session.flush()
+        log = AuditLog(
+            user_id=admin.id,
+            username=admin.username,
+            action="asset.ledger.update",
+            module="资产台账",
+            summary="编辑资产：标签解析测试",
+            status="SUCCESS",
+            before_data={"custodian_id": admin.id, "dept_id": dept.id},
+            after_data={"custodian_id": target.id, "dept_id": dept.id},
+        )
+        session.add(log)
+        await session.commit()
+        log_id = log.id
+        target_id = target.id
+
+    detail = await client.get(f"/api/v1/audit-logs/{log_id}", headers=headers)
+    assert detail.status_code == 200, detail.text
+    data = detail.json()["data"]
+    assert data["before_labels"] == {
+        "custodian_id": "系统管理员（admin）",
+        "dept_id": "标签部门",
+    }
+    assert data["after_labels"] == {
+        "custodian_id": "标签用户（labeluser01）",
+        "dept_id": "标签部门",
+    }
+    assert data["after_data"]["custodian_id"] == target_id
 
 
 async def test_audit_log_data_scope_and_permission(client):

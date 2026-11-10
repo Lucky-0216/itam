@@ -1,5 +1,10 @@
 from datetime import timedelta
 
+from sqlalchemy import update
+
+from app.core.assets import AssetStatus
+from app.core.database import AsyncSessionLocal
+from app.models import Asset
 from app.models.base import now_cst
 from tests.helpers import auth_headers, login
 
@@ -8,9 +13,12 @@ async def test_dashboard_summary_metrics_and_charts(client):
     tokens = await login(client)
     headers = auth_headers(tokens["access_token"])
 
-    empty = await client.get("/api/v1/dashboard/summary", headers=headers)
+    empty = await client.get(
+        "/api/v1/dashboard/summary?scope=org", headers=headers
+    )
     assert empty.status_code == 200, empty.text
     empty_data = empty.json()["data"]
+    assert empty_data["scope"] == "org"
     assert empty_data["metrics"]["total_assets"] == 0
     assert len(empty_data["purchase_trend"]) == 12
     assert empty_data["status_distribution"]
@@ -47,7 +55,9 @@ async def test_dashboard_summary_metrics_and_charts(client):
     )
     assert created.status_code == 200, created.text
 
-    summary = await client.get("/api/v1/dashboard/summary", headers=headers)
+    summary = await client.get(
+        "/api/v1/dashboard/summary?scope=org", headers=headers
+    )
     assert summary.status_code == 200, summary.text
     data = summary.json()["data"]
 
@@ -153,7 +163,7 @@ async def test_dashboard_dept_filter_period_and_contract(client):
     assert contract.status_code == 200, contract.text
 
     all_summary = await client.get(
-        "/api/v1/dashboard/summary?months=3", headers=headers
+        "/api/v1/dashboard/summary?scope=org&months=3", headers=headers
     )
     assert all_summary.status_code == 200, all_summary.text
     all_data = all_summary.json()["data"]
@@ -164,7 +174,7 @@ async def test_dashboard_dept_filter_period_and_contract(client):
     assert len(all_data["purchase_trend"]) == 3
 
     filtered = await client.get(
-        f"/api/v1/dashboard/summary?dept_id={it_id}", headers=headers
+        f"/api/v1/dashboard/summary?scope=org&dept_id={it_id}", headers=headers
     )
     assert filtered.status_code == 200, filtered.text
     filtered_data = filtered.json()["data"]
@@ -176,11 +186,106 @@ async def test_dashboard_dept_filter_period_and_contract(client):
     ]
 
     empty = await client.get(
-        f"/api/v1/dashboard/summary?dept_id={dept_ids['HR']}", headers=headers
+        f"/api/v1/dashboard/summary?scope=org&dept_id={dept_ids['HR']}", headers=headers
     )
     assert empty.status_code == 200, empty.text
     empty_data = empty.json()["data"]
     assert empty_data["metrics"]["total_assets"] == 0
     assert empty_data["metrics"]["contract_expiring"] == 0
     assert empty_data["category_distribution"] == []
+
+    all_history = await client.get(
+        "/api/v1/dashboard/summary?scope=org&months=0", headers=headers
+    )
+    assert all_history.status_code == 200, all_history.text
+    all_history_data = all_history.json()["data"]
+    assert all_history_data["period"]["months"] == 0
+    assert all_history_data["period"]["new_assets"] == 2
+    assert str(all_history_data["period"]["start_date"]) == "1970-01-01"
+    assert all_history_data["purchase_trend"] == [
+        {"month": f"{today.year:04d}", "count": 2}
+    ]
+
+
+async def test_dashboard_defaults_to_personal_scope(client):
+    tokens = await login(client)
+    headers = auth_headers(tokens["access_token"])
+    profile = await client.get("/api/v1/auth/me", headers=headers)
+    assert profile.status_code == 200, profile.text
+    admin_id = profile.json()["data"]["user"]["id"]
+
+    category = await client.post(
+        "/api/v1/asset-categories",
+        json={
+            "name": "个人口径分类",
+            "code": "DASH-MINE",
+            "category_type": "HARDWARE",
+            "sort": 10,
+            "status": 1,
+        },
+        headers=headers,
+    )
+    assert category.status_code == 200, category.text
+    category_id = category.json()["data"]["id"]
+
+    today = now_cst().date()
+    mine = await client.post(
+        "/api/v1/assets",
+        json={
+            "name": "我的工作台资产",
+            "category_id": category_id,
+            "custodian_id": admin_id,
+            "purchase_date": today.isoformat(),
+            "purchase_price": 880.0,
+            "warranty_end": (today + timedelta(days=12)).isoformat(),
+        },
+        headers=headers,
+    )
+    assert mine.status_code == 200, mine.text
+    mine_id = mine.json()["data"]["id"]
+    async with AsyncSessionLocal() as session:
+        await session.execute(
+            update(Asset)
+            .where(Asset.id == mine_id)
+            .values(status=AssetStatus.IN_USE)
+        )
+        await session.commit()
+
+    other = await client.post(
+        "/api/v1/assets",
+        json={
+            "name": "他人的工作台资产",
+            "category_id": category_id,
+            "purchase_date": today.isoformat(),
+            "purchase_price": 500.0,
+        },
+        headers=headers,
+    )
+    assert other.status_code == 200, other.text
+
+    personal = await client.get("/api/v1/dashboard/summary", headers=headers)
+    assert personal.status_code == 200, personal.text
+    data = personal.json()["data"]
+    assert data["scope"] == "personal"
+    assert data["data_scope_label"] == "我的资产"
+    assert data["metrics"]["total_assets"] == 1
+    assert data["metrics"]["total_value"] == 880.0
+    assert data["metrics"]["in_use"] == 1
+    assert data["metrics"]["warranty_30d"] == 1
+    assert data["period"]["new_assets"] == 1
+    assert data["dept_options"]
+    assert data["dept_id"] is None
+    assert sum(item["count"] for item in data["dept_distribution"]) == 1
+    assert [item["name"] for item in data["category_distribution"]] == ["个人口径分类"]
+    assert [item["name"] for item in data["recent_assets"]] == ["我的工作台资产"]
+
+    org = await client.get(
+        "/api/v1/dashboard/summary?scope=org", headers=headers
+    )
+    assert org.status_code == 200, org.text
+    org_data = org.json()["data"]
+    assert org_data["scope"] == "org"
+    assert org_data["data_scope_label"] == "全部数据"
+    assert org_data["metrics"]["total_assets"] == 2
+    assert org_data["metrics"]["total_value"] == 1380.0
 

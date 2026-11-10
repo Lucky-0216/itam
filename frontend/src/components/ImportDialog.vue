@@ -280,7 +280,7 @@ async function submit(): Promise<void> {
 }
 
 .import-upload-text em {
-  color: var(--brand-500, #3b82f6);
+  color: var(--brand, #4a6da8);
   font-style: normal;
 }
 

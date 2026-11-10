@@ -76,13 +76,13 @@ function handleSelect(index: string): void {
   flex-direction: column;
   gap: 4px;
   padding: 26px 18px;
-  color: #7388a6;
+  color: var(--sidebar-status);
   font-size: 12.5px;
   text-align: center;
 }
 
 .sidebar-empty small {
-  color: #566982;
+  color: var(--sidebar-brand-sub);
   font-size: 11px;
 }
 

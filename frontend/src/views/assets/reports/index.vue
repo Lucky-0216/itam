@@ -368,21 +368,23 @@ const chartPalette = computed(() => {
   const dark = app.isDark
   return {
     dark,
+    primary: app.primary,
     text2: cssVar('--text-2', '#5c6b83'),
     text3: cssVar('--text-3', '#93a0b4'),
     border: cssVar('--border', '#e5ebf4'),
     surface: cssVar('--surface', '#ffffff'),
+    brand: cssVar('--brand', '#4a6da8'),
   }
 })
 
 function tooltipStyle(): Record<string, unknown> {
   const palette = chartPalette.value
   return {
-    backgroundColor: palette.dark ? 'rgba(17, 27, 45, 0.96)' : 'rgba(255, 255, 255, 0.98)',
+    backgroundColor: cssVar('--el-bg-color-overlay', '#fdfdfe'),
     borderColor: palette.border,
     borderWidth: 1,
     padding: [8, 12],
-    textStyle: { color: palette.dark ? '#eaf0fb' : '#0f172a', fontSize: 12 },
+    textStyle: { color: cssVar('--text-1', '#1d2430'), fontSize: 12 },
     extraCssText: 'border-radius:10px;box-shadow:0 14px 34px -20px rgba(15,23,42,0.45);',
   }
 }
@@ -450,9 +452,9 @@ const trendOption = computed<EChartsCoreOption>(() => {
         smooth: 0.35,
         showSymbol: false,
         data: points.map((item) => item.count),
-        lineStyle: { width: 2.5, color: '#2563eb' },
-        itemStyle: { color: '#2563eb', borderColor: palette.surface, borderWidth: 2 },
-        areaStyle: { color: 'rgba(37, 99, 235, 0.10)' },
+        lineStyle: { width: 2.5, color: palette.brand },
+        itemStyle: { color: palette.brand, borderColor: palette.surface, borderWidth: 2 },
+        areaStyle: { color: palette.brand, opacity: 0.12 },
       },
     ],
   }
@@ -487,7 +489,7 @@ const categoryOption = computed<EChartsCoreOption>(() => {
         barWidth: 12,
         showBackground: true,
         backgroundStyle: { color: 'rgba(15,23,42,0.04)', borderRadius: 6 },
-        itemStyle: { borderRadius: [0, 6, 6, 0], color: '#2563eb' },
+        itemStyle: { borderRadius: [0, 6, 6, 0], color: palette.brand },
         label: {
           show: true,
           position: 'right',
@@ -1190,7 +1192,7 @@ onMounted(() => {
 }
 
 .metric-card.is-blue::before {
-  background: #2563eb;
+  background: var(--brand);
 }
 
 .metric-card.is-teal::before {
@@ -1428,7 +1430,7 @@ onMounted(() => {
   display: block;
   height: 100%;
   border-radius: inherit;
-  background: linear-gradient(90deg, rgba(37, 99, 235, 0.75), #06b6d4);
+  background: linear-gradient(90deg, var(--brand), var(--brand-cyan));
 }
 
 .mini-grid {
@@ -1547,14 +1549,14 @@ onMounted(() => {
 }
 
 .issue-card:hover {
-  border-color: rgba(37, 99, 235, 0.45);
+  border-color: var(--brand);
   box-shadow: var(--shadow-sm);
   transform: translateY(-1px);
 }
 
 .issue-card.active {
   border-color: var(--brand);
-  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.12);
+  box-shadow: 0 0 0 2px var(--brand-soft);
 }
 
 .issue-card.is-warning strong {
@@ -1562,7 +1564,7 @@ onMounted(() => {
 }
 
 .issue-card.is-info strong {
-  color: #2563eb;
+  color: var(--brand);
 }
 
 .issue-title {
@@ -1589,7 +1591,7 @@ onMounted(() => {
 }
 
 .issue-card.all {
-  background: linear-gradient(135deg, rgba(37, 99, 235, 0.06), rgba(6, 182, 212, 0.04));
+  background: var(--gradient-brand-soft);
 }
 
 .issue-tags {

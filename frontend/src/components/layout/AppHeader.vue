@@ -6,6 +6,8 @@ import {
   ArrowDown,
   ArrowRight,
   Bell,
+  Brush,
+  Check,
   Connection,
   DataAnalysis,
   Expand,
@@ -27,7 +29,7 @@ import {
 
 import { notificationApi } from '@/api/notifications'
 import { searchApi } from '@/api/search'
-import { useAppStore } from '@/stores/app'
+import { useAppStore, type ThemePrimary } from '@/stores/app'
 import { useAuthStore } from '@/stores/auth'
 import { useTodoStore } from '@/stores/todo'
 import type { NotificationItem } from '@/types/notification'
@@ -45,6 +47,13 @@ const todoStore = useTodoStore()
 const route = useRoute()
 const router = useRouter()
 const canViewReminders = computed(() => auth.hasPerm('asset:reminder:view'))
+
+const themePrimary: { value: ThemePrimary; label: string; hint: string; swatch: string }[] = [
+  { value: 'blue', label: '雾蓝', hint: '沉静 · 默认', swatch: 'linear-gradient(120deg, #47679d, #5b82b6)' },
+  { value: 'teal', label: '青瓷', hint: '松绿 · 温和', swatch: 'linear-gradient(120deg, #3f6f68, #5d968c)' },
+  { value: 'violet', label: '黛紫', hint: '雅致 · 克制', swatch: 'linear-gradient(120deg, #57497f, #7b6aa9)' },
+  { value: 'white', label: '纯白', hint: '单色 · 极简', swatch: 'linear-gradient(120deg, #ffffff, #e9edf3)' },
+]
 
 const isFullscreen = ref(false)
 const refreshing = ref(false)
@@ -304,6 +313,8 @@ async function handleLogout(): Promise<void> {
 function handleCommand(command: string): void {
   if (command === 'password') {
     void router.push('/change-password')
+  } else if (command === 'appearance') {
+    void router.push('/settings/appearance')
   } else if (command === 'logout') {
     void handleLogout()
   }
@@ -406,13 +417,61 @@ onBeforeUnmount(() => {
         </button>
       </el-tooltip>
 
-      <el-tooltip :content="appStore.isDark ? '切换到浅色主题' : '切换到深色主题'" placement="bottom">
-        <button class="header-icon-btn" type="button" aria-label="切换主题" @click="appStore.toggleTheme()">
-          <el-icon :size="18">
-            <component :is="appStore.isDark ? Sunny : Moon" />
-          </el-icon>
+      <el-dropdown trigger="click" placement="bottom-end">
+        <button class="header-icon-btn" type="button" aria-label="主题设置">
+          <el-icon :size="18"><Brush /></el-icon>
         </button>
-      </el-tooltip>
+        <template #dropdown>
+          <div class="theme-panel">
+            <p class="theme-label">外观模式</p>
+            <div class="theme-mode">
+              <button
+                type="button"
+                class="theme-mode-btn"
+                :class="{ active: !appStore.isDark }"
+                @click="appStore.setTheme('light')"
+              >
+                <el-icon><Sunny /></el-icon>
+                <span>亮色</span>
+              </button>
+              <button
+                type="button"
+                class="theme-mode-btn"
+                :class="{ active: appStore.isDark }"
+                @click="appStore.setTheme('dark')"
+              >
+                <el-icon><Moon /></el-icon>
+                <span>暗色</span>
+              </button>
+            </div>
+
+            <p class="theme-label">主色</p>
+            <div class="theme-list">
+              <button
+                v-for="item in themePrimary"
+                :key="item.value"
+                type="button"
+                class="theme-option"
+                :class="{ active: appStore.primary === item.value }"
+                @click="appStore.setPrimary(item.value)"
+              >
+                <span class="theme-swatch" :style="{ background: item.swatch }" />
+                <span class="theme-copy">
+                  <strong>{{ item.label }}</strong>
+                  <small>{{ item.hint }}</small>
+                </span>
+                <el-icon v-if="appStore.primary === item.value" class="theme-check">
+                  <Check />
+                </el-icon>
+              </button>
+            </div>
+            <button class="theme-more" type="button" @click="router.push('/settings/appearance')">
+              更多外观设置
+              <el-icon><ArrowRight /></el-icon>
+            </button>
+          </div>
+        </template>
+      </el-dropdown>
 
       <el-tooltip :content="isFullscreen ? '退出全屏' : '全屏显示'" placement="bottom">
         <button class="header-icon-btn" type="button" aria-label="切换全屏" @click="toggleFullscreen">
@@ -476,6 +535,7 @@ onBeforeUnmount(() => {
                 最近登录：{{ formatDateTime(auth.profile?.last_login_at) }}
               </span>
             </div>
+            <el-dropdown-item command="appearance" :icon="Brush">外观设置</el-dropdown-item>
             <el-dropdown-item command="password" :icon="Lock">修改密码</el-dropdown-item>
             <el-dropdown-item command="logout" :icon="SwitchButton" divided>退出登录</el-dropdown-item>
           </el-dropdown-menu>
@@ -678,7 +738,7 @@ onBeforeUnmount(() => {
   height: 38px;
   border-radius: 11px;
   background: var(--gradient-brand);
-  color: #fff;
+  color: var(--on-brand);
   font-size: 12.5px;
   font-weight: 700;
 }
@@ -727,6 +787,143 @@ onBeforeUnmount(() => {
   font-size: 13px;
 }
 
+.theme-panel {
+  width: 236px;
+  padding: 12px;
+}
+
+.theme-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 0 2px 8px;
+  color: var(--text-3);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+}
+
+.theme-list + .theme-label {
+  margin-top: 14px;
+}
+
+.theme-more {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  width: 100%;
+  margin-top: 10px;
+  padding: 7px 0 2px;
+  border: 0;
+  border-top: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-3);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.theme-more:hover {
+  color: var(--brand);
+}
+
+.theme-mode {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.theme-mode-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 34px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface-muted);
+  color: var(--text-2);
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: border-color 0.18s ease, background-color 0.18s ease, color 0.18s ease;
+}
+
+.theme-mode-btn:hover {
+  border-color: var(--border-strong);
+  color: var(--text-1);
+}
+
+.theme-mode-btn.active {
+  border-color: var(--brand);
+  background: var(--brand-soft);
+  color: var(--brand-strong);
+}
+
+html.dark .theme-mode-btn.active {
+  color: color-mix(in srgb, var(--brand) 58%, #ffffff);
+}
+
+.theme-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.theme-option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 0.18s ease, border-color 0.18s ease;
+}
+
+.theme-option:hover {
+  background: var(--surface-muted);
+}
+
+.theme-option.active {
+  border-color: var(--brand);
+  background: var(--brand-soft);
+}
+
+.theme-swatch {
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+  border-radius: 8px;
+  box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.16);
+}
+
+.theme-copy {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.3;
+}
+
+.theme-copy strong {
+  color: var(--text-1);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.theme-copy small {
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.theme-check {
+  margin-left: auto;
+  color: var(--brand);
+  font-size: 14px;
+}
+
 .notification-btn {
   position: relative;
 }
@@ -737,6 +934,7 @@ onBeforeUnmount(() => {
 
 .todo-badge {
   background: var(--brand);
+  color: var(--on-brand);
 }
 
 .notification-badge {
@@ -747,7 +945,7 @@ onBeforeUnmount(() => {
   height: 17px;
   padding: 0 4px;
   border-radius: 999px;
-  background: #ef4444;
+  background: var(--danger);
   color: #fff;
   font-size: 10px;
   font-weight: 700;
@@ -824,7 +1022,7 @@ onBeforeUnmount(() => {
 }
 
 .notification-item.unread {
-  border-color: rgba(37, 99, 235, 0.22);
+  border-color: var(--brand);
   background: var(--gradient-brand-soft);
 }
 
@@ -913,7 +1111,7 @@ onBeforeUnmount(() => {
 }
 
 .notification-item.unread .notification-category {
-  background: rgba(37, 99, 235, 0.1);
+  background: var(--brand-soft);
   color: var(--brand);
 }
 

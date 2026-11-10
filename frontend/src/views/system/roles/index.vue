@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { isAxiosError } from 'axios'
 import {
   ElMessage,
@@ -324,6 +324,16 @@ const fieldState = ref<Record<string, Record<string, { can_view: boolean; can_ed
 const memberIds = ref<number[]>([])
 const memberOptions = ref<RoleUserOption[]>([])
 const memberSearchLoading = ref(false)
+const memberKeyword = ref('')
+const memberResults = ref<RoleUserOption[]>([])
+const memberHasSearched = ref(false)
+const memberFilter = ref<'all' | 'in' | 'out'>('all')
+const memberBaselineIds = ref<number[]>([])
+const selectedMemberKeyword = ref('')
+const selectedMemberPage = ref(1)
+const selectedMemberPageSize = 10
+let memberSearchSeq = 0
+let memberSearchTimer: number | undefined
 const pendingMenuHydration = ref(true)
 const pendingDataHydration = ref(true)
 
@@ -441,6 +451,7 @@ function mergeMemberOptions(detail: RoleDetail): void {
   }
   memberOptions.value = merged
   memberIds.value = detail.users.map((user) => user.id)
+  memberBaselineIds.value = [...memberIds.value]
 }
 
 function buildResourceState(detail: RoleDetail): Record<string, ResourceScopeState> {
@@ -520,6 +531,7 @@ async function openAuthorization(row: RoleItem): Promise<void> {
   drawerVisible.value = true
   activeTab.value = 'menu'
   currentRole.value = null
+  resetMemberPanel()
   detailLoading.value = true
   try {
     const [detail, meta, menus] = await Promise.all([
@@ -546,8 +558,8 @@ watch(activeTab, async (tab) => {
     await nextTick()
     applyPendingChecks()
   }
-  if (tab === 'member' && canAssignUsers.value && !memberOptions.value.length) {
-    void searchMemberOptions('')
+  if (tab === 'member' && canAssignUsers.value && !memberHasSearched.value) {
+    void searchMemberOptions(memberKeyword.value)
   }
 })
 
@@ -585,34 +597,148 @@ function setFieldEdit(
 
 async function searchMemberOptions(keyword: string): Promise<void> {
   if (!canAssignUsers.value) return
+  const seq = ++memberSearchSeq
   memberSearchLoading.value = true
   try {
     const items = await roleApi.userOptions(keyword.trim())
-    const merged = [...items]
-    for (const user of currentRole.value?.users ?? []) {
+    if (seq !== memberSearchSeq) return
+    const merged = [...memberOptions.value]
+    for (const user of items) {
       if (!merged.some((item) => item.id === user.id)) {
         merged.push(user)
       }
     }
     memberOptions.value = merged
+    memberResults.value = items
+    memberHasSearched.value = true
   } catch {
     // 请求层已提示错误
   } finally {
-    memberSearchLoading.value = false
+    if (seq === memberSearchSeq) memberSearchLoading.value = false
   }
 }
 
-function handleMemberSelectVisible(visible: boolean): void {
-  if (visible && canAssignUsers.value && !memberOptions.value.length) {
-    void searchMemberOptions('')
+watch(memberKeyword, (value) => {
+  if (activeTab.value !== 'member') return
+  if (memberSearchTimer) window.clearTimeout(memberSearchTimer)
+  memberSearchTimer = window.setTimeout(() => {
+    void searchMemberOptions(value)
+  }, 350)
+})
+
+onBeforeUnmount(() => {
+  if (memberSearchTimer) window.clearTimeout(memberSearchTimer)
+})
+
+function resetMemberPanel(): void {
+  if (memberSearchTimer) window.clearTimeout(memberSearchTimer)
+  memberKeyword.value = ''
+  memberResults.value = []
+  memberHasSearched.value = false
+  memberFilter.value = 'all'
+  selectedMemberKeyword.value = ''
+  selectedMemberPage.value = 1
+}
+
+const memberLookup = computed(() => {
+  const map = new Map<number, RoleUserOption>()
+  for (const user of currentRole.value?.users ?? []) map.set(user.id, user)
+  for (const user of memberOptions.value) {
+    if (!map.has(user.id)) map.set(user.id, user)
+  }
+  return map
+})
+
+function userById(id: number): RoleUserOption | undefined {
+  return memberLookup.value.get(id)
+}
+
+const memberSet = computed(() => new Set(memberIds.value))
+
+const memberPendingText = computed(() => {
+  const added = memberIds.value.filter((id) => !memberBaselineIds.value.includes(id)).length
+  const removed = memberBaselineIds.value.filter((id) => !memberIds.value.includes(id)).length
+  if (!added && !removed) return ''
+  const parts: string[] = []
+  if (added) parts.push(`新增 ${added} 人`)
+  if (removed) parts.push(`移除 ${removed} 人`)
+  return parts.join('，')
+})
+
+const filteredMemberResults = computed(() => {
+  if (memberFilter.value === 'in') {
+    return memberResults.value.filter((user) => memberSet.value.has(user.id))
+  }
+  if (memberFilter.value === 'out') {
+    return memberResults.value.filter((user) => !memberSet.value.has(user.id))
+  }
+  return memberResults.value
+})
+
+const selectedMembers = computed<RoleUserOption[]>(() =>
+  memberIds.value.map(
+    (id) =>
+      userById(id) ?? {
+        id,
+        username: `#${id}`,
+        real_name: '未知用户',
+        dept_name: null,
+        status: 0,
+      },
+  ),
+)
+
+const filteredSelectedMembers = computed(() => {
+  const keyword = selectedMemberKeyword.value.trim().toLowerCase()
+  if (!keyword) return selectedMembers.value
+  return selectedMembers.value.filter((user) =>
+    `${user.real_name} ${user.username} ${user.dept_name ?? ''}`
+      .toLowerCase()
+      .includes(keyword),
+  )
+})
+
+const pagedSelectedMembers = computed(() => {
+  const start = (selectedMemberPage.value - 1) * selectedMemberPageSize
+  return filteredSelectedMembers.value.slice(start, start + selectedMemberPageSize)
+})
+
+watch(selectedMemberKeyword, () => {
+  selectedMemberPage.value = 1
+})
+
+watch(
+  () => filteredSelectedMembers.value.length,
+  (total) => {
+    const maxPage = Math.max(1, Math.ceil(total / selectedMemberPageSize))
+    if (selectedMemberPage.value > maxPage) selectedMemberPage.value = maxPage
+  },
+)
+
+function addMember(user: RoleUserOption): void {
+  if (!canEditMembers.value) return
+  if (!memberOptions.value.some((item) => item.id === user.id)) {
+    memberOptions.value = [...memberOptions.value, user]
+  }
+  if (!memberIds.value.includes(user.id)) {
+    memberIds.value = [...memberIds.value, user.id]
   }
 }
 
-function memberLabel(id: number): string {
-  const user =
-    memberOptions.value.find((item) => item.id === id) ||
-    currentRole.value?.users.find((item) => item.id === id)
-  return user ? `${user.real_name}（${user.username}）` : `用户 #${id}`
+function removeMember(id: number): void {
+  if (!canEditMembers.value) return
+  memberIds.value = memberIds.value.filter((item) => item !== id)
+}
+
+function bulkAddVisible(): void {
+  if (!canEditMembers.value) return
+  const targets = filteredMemberResults.value.filter((user) => !memberSet.value.has(user.id))
+  if (!targets.length) {
+    ElMessage.info('当前搜索结果中没有可加入的人员')
+    return
+  }
+  memberIds.value = [...memberIds.value, ...targets.map((user) => user.id)]
+  ElMessage.success(`已加入 ${targets.length} 人，保存后生效`)
 }
 
 function checkedDeptIds(): number[] {
@@ -1180,7 +1306,7 @@ onMounted(() => {
                     class="drawer-alert"
                   />
                   <p class="tab-hint">
-                    多个角色的指定资产域取并集；只有显式「全部资产域」才表示不限域。
+                    多个角色的指定资产域取并集；只要任一角色指定了资产域，就按该并集限制，全部资产域不再放宽。
                   </p>
                 </div>
 
@@ -1362,8 +1488,13 @@ onMounted(() => {
               <div class="tab-toolbar">
                 <div class="toolbar-copy">
                   <strong>成员分配</strong>
-                  <span>已选 {{ memberIds.length }} 人；成员变更在保存后立即影响后端鉴权。</span>
+                  <span>
+                    已选 {{ memberIds.length }} 人<template v-if="memberPendingText">（{{ memberPendingText }}，未保存）</template>；成员变更在保存后立即影响后端鉴权。
+                  </span>
                 </div>
+                <el-tag v-if="memberPendingText" type="warning" effect="light" round>
+                  待保存
+                </el-tag>
               </div>
               <el-alert
                 v-if="isSuperRole"
@@ -1374,51 +1505,198 @@ onMounted(() => {
                 description="只有超级管理员可以调整超级管理员成员，且系统必须保留至少一名启用的超级管理员。"
                 class="member-alert"
               />
-              <el-select
-                v-model="memberIds"
-                multiple
-                filterable
-                remote
-                reserve-keyword
-                :remote-method="searchMemberOptions"
-                :loading="memberSearchLoading"
-                :disabled="!canEditMembers"
-                class="member-select"
-                placeholder="输入姓名或用户名搜索成员"
-                @visible-change="handleMemberSelectVisible"
-              >
-                <el-option
-                  v-for="user in memberOptions"
-                  :key="user.id"
-                  :value="user.id"
-                  :label="`${user.real_name}（${user.username}）`"
-                >
-                  <div class="member-option">
-                    <span>
-                      {{ user.real_name }}
-                      <small>@{{ user.username }}</small>
-                    </span>
-                    <small>
-                      {{ user.dept_name || '未分配部门' }}
-                      <em v-if="user.status !== 1">已停用</em>
-                    </small>
-                  </div>
-                </el-option>
-              </el-select>
 
-              <div class="current-members">
-                <div class="subhead">
-                  <strong>已选成员</strong>
-                  <span>保存后立即写入审计日志</span>
+              <section class="member-panel">
+                <div class="panel-head">
+                  <div class="panel-title">
+                    <strong>查找并添加成员</strong>
+                    <span>按姓名、用户名或工号搜索，列表直接标注是否已在角色内</span>
+                  </div>
+                  <el-radio-group
+                    v-model="memberFilter"
+                    size="small"
+                    :disabled="!memberResults.length"
+                  >
+                    <el-radio-button value="all">全部</el-radio-button>
+                    <el-radio-button value="out">未加入</el-radio-button>
+                    <el-radio-button value="in">已加入</el-radio-button>
+                  </el-radio-group>
                 </div>
-                <div v-if="memberIds.length" class="member-grid">
-                  <span v-for="id in memberIds" :key="id" class="member-chip">
-                    <span class="member-avatar">{{ initials(memberLabel(id).slice(0, 2)) }}</span>
-                    <span class="member-name">{{ memberLabel(id) }}</span>
+                <div class="member-search-row">
+                  <el-input
+                    v-model="memberKeyword"
+                    clearable
+                    :prefix-icon="Search"
+                    :disabled="!canAssignUsers"
+                    placeholder="搜索姓名、用户名或工号，输入后自动检索"
+                  />
+                  <el-button
+                    :loading="memberSearchLoading"
+                    :disabled="!canAssignUsers"
+                    @click="searchMemberOptions(memberKeyword)"
+                  >
+                    搜索
+                  </el-button>
+                  <el-button
+                    type="primary"
+                    plain
+                    :disabled="!canEditMembers || !filteredMemberResults.length"
+                    @click="bulkAddVisible"
+                  >
+                    加入当前结果
+                  </el-button>
+                </div>
+                <el-table
+                  v-loading="memberSearchLoading"
+                  :data="filteredMemberResults"
+                  size="small"
+                  height="236"
+                  class="member-table"
+                  empty-text="没有匹配的人员"
+                >
+                  <el-table-column label="人员" min-width="180">
+                    <template #default="{ row }">
+                      <div class="member-cell">
+                        <span class="member-avatar">{{
+                          initials(row.real_name.slice(0, 2))
+                        }}</span>
+                        <div>
+                          <strong>{{ row.real_name }}</strong>
+                          <small>@{{ row.username }}</small>
+                        </div>
+                      </div>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="部门" min-width="160" show-overflow-tooltip>
+                    <template #default="{ row }">{{ row.dept_name || '未分配部门' }}</template>
+                  </el-table-column>
+                  <el-table-column label="角色状态" width="96" align="center">
+                    <template #default="{ row }">
+                      <el-tag
+                        v-if="memberSet.has(row.id)"
+                        type="success"
+                        size="small"
+                        effect="light"
+                      >
+                        已加入
+                      </el-tag>
+                      <el-tag v-else size="small" type="info" effect="plain">未加入</el-tag>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="操作" width="78" align="right">
+                    <template #default="{ row }">
+                      <el-button
+                        v-if="memberSet.has(row.id)"
+                        link
+                        type="danger"
+                        :disabled="!canEditMembers"
+                        @click="removeMember(row.id)"
+                      >
+                        移除
+                      </el-button>
+                      <el-button
+                        v-else
+                        link
+                        type="primary"
+                        :disabled="!canEditMembers"
+                        @click="addMember(row)"
+                      >
+                        加入
+                      </el-button>
+                    </template>
+                  </el-table-column>
+                </el-table>
+                <p class="panel-hint">
+                  搜索最多返回 50 名启用用户；「加入当前结果」会批量加入当前筛选下未加入的人员。
+                </p>
+              </section>
+
+              <section class="member-panel">
+                <div class="panel-head">
+                  <div class="panel-title">
+                    <strong>已选成员</strong>
+                    <span>
+                      共 {{ memberIds.length }} 人<template v-if="selectedMemberKeyword.trim()"
+                        >，筛选出 {{ filteredSelectedMembers.length }} 人</template
+                      >
+                    </span>
+                  </div>
+                  <el-input
+                    v-model="selectedMemberKeyword"
+                    size="small"
+                    clearable
+                    :prefix-icon="Search"
+                    placeholder="在已选成员中筛选"
+                    class="selected-filter"
+                  />
+                </div>
+                <el-table
+                  :data="pagedSelectedMembers"
+                  size="small"
+                  height="260"
+                  empty-text="尚未选择成员"
+                >
+                  <el-table-column label="人员" min-width="180">
+                    <template #default="{ row }">
+                      <div class="member-cell">
+                        <span class="member-avatar">{{
+                          initials(row.real_name.slice(0, 2))
+                        }}</span>
+                        <div>
+                          <strong>{{ row.real_name }}</strong>
+                          <small>@{{ row.username }}</small>
+                        </div>
+                      </div>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="部门" min-width="160" show-overflow-tooltip>
+                    <template #default="{ row }">{{ row.dept_name || '未分配部门' }}</template>
+                  </el-table-column>
+                  <el-table-column label="账号" width="80" align="center">
+                    <template #default="{ row }">
+                      <el-tag
+                        v-if="row.status === 1"
+                        size="small"
+                        type="success"
+                        effect="plain"
+                      >
+                        启用
+                      </el-tag>
+                      <el-tag v-else size="small" type="danger" effect="plain">停用</el-tag>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="操作" width="78" align="right">
+                    <template #default="{ row }">
+                      <el-button
+                        link
+                        type="danger"
+                        :disabled="!canEditMembers"
+                        @click="removeMember(row.id)"
+                      >
+                        移除
+                      </el-button>
+                    </template>
+                  </el-table-column>
+                </el-table>
+                <div class="member-pager">
+                  <span>
+                    第 {{ selectedMemberPage }} /
+                    {{ Math.max(1, Math.ceil(filteredSelectedMembers.length / selectedMemberPageSize)) }}
+                    页
                   </span>
+                  <el-pagination
+                    v-model:current-page="selectedMemberPage"
+                    :page-size="selectedMemberPageSize"
+                    :total="filteredSelectedMembers.length"
+                    layout="prev, pager, next"
+                    small
+                    background
+                  />
                 </div>
-                <p v-else class="empty-note">尚未选择成员</p>
-              </div>
+              </section>
+              <p v-if="!canEditMembers" class="empty-note">
+                当前账号没有成员分配权限，仅可查看。
+              </p>
             </el-tab-pane>
           </el-tabs>
         </template>
@@ -1471,7 +1749,7 @@ onMounted(() => {
   border: 1px solid var(--border);
   border-radius: 14px;
   background:
-    radial-gradient(320px 120px at 8% 0%, rgba(37, 99, 235, 0.08), transparent 70%),
+    radial-gradient(320px 120px at 8% 0%, color-mix(in srgb, var(--brand) 8%, transparent), transparent 70%),
     var(--surface-muted);
 }
 
@@ -1488,8 +1766,8 @@ onMounted(() => {
   height: 38px;
   border-radius: 11px;
   background: var(--gradient-brand);
-  color: #fff;
-  box-shadow: 0 10px 22px -14px rgba(37, 99, 235, 0.9);
+  color: var(--on-brand);
+  box-shadow: 0 10px 22px -14px var(--brand-glow);
 }
 
 .summary-label {
@@ -2012,71 +2290,131 @@ onMounted(() => {
   margin-bottom: 10px;
 }
 
-.member-select {
-  width: 100%;
+.member-panel {
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface-muted);
 }
 
-.member-option {
+.member-panel + .member-panel {
+  margin-top: 12px;
+}
+
+.panel-head {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
-  gap: 16px;
+  gap: 14px;
+  margin-bottom: 10px;
+}
+
+.panel-title {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
   min-width: 0;
 }
 
-.member-option span {
+.panel-title strong {
   color: var(--text-1);
-  font-size: 12.5px;
+  font-size: 13px;
+  font-weight: 600;
 }
 
-.member-option small {
+.panel-title span {
+  color: var(--text-3);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.member-search-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.member-search-row :deep(.el-input) {
+  flex: 1;
+  min-width: 0;
+}
+
+.member-search-row :deep(.el-button) {
+  flex-shrink: 0;
+  margin-left: 0;
+}
+
+.member-table :deep(.el-table__inner-wrapper) {
+  border-radius: 10px;
+}
+
+.member-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.member-cell div {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.35;
+}
+
+.member-cell strong {
+  overflow: hidden;
+  color: var(--text-1);
+  font-size: 12.5px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.member-cell small {
   color: var(--text-3);
   font-size: 10.5px;
 }
 
-.member-option em {
-  margin-left: 5px;
-  color: var(--danger);
-  font-style: normal;
-}
-
-.current-members {
-  margin-top: 18px;
-  padding-top: 15px;
-  border-top: 1px dashed var(--border);
-}
-
-.member-grid {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 7px;
-}
-
-.member-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  padding: 4px 10px 4px 4px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  background: var(--surface-muted);
-}
-
 .member-avatar {
+  flex-shrink: 0;
   display: grid;
   place-items: center;
   width: 24px;
   height: 24px;
   border-radius: 50%;
   background: var(--gradient-brand);
-  color: #fff;
+  color: var(--on-brand);
   font-size: 9.5px;
   font-weight: 700;
 }
 
-.member-name {
-  color: var(--text-2);
-  font-size: 11.5px;
+.panel-hint {
+  margin: 8px 0 0;
+  color: var(--text-3);
+  font-size: 10.5px;
+  line-height: 1.5;
+}
+
+.selected-filter {
+  flex-shrink: 0;
+  width: 200px;
+}
+
+.member-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 10px;
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.member-pager :deep(.el-pagination) {
+  padding: 0;
 }
 
 .empty-note {

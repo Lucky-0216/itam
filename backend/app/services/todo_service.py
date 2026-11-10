@@ -680,7 +680,6 @@ class TodoService:
                 and_(
                     AssetRequest.applicant_id == user_id,
                     AssetRequest.status.in_(ACTIVE_REQUEST_STATUSES),
-                    self._request_domain_condition(context),
                     ~or_(request_actionable, borrow_due_soon),
                 ),
             )
@@ -728,9 +727,6 @@ class TodoService:
                 and_(
                     AssetTransfer.applicant_id == user_id,
                     AssetTransfer.status.in_(TRANSFER_ACTIVE_STATUSES),
-                    self._asset_domain_condition(
-                        AssetTransfer.asset_id, context, "transfer"
-                    ),
                     ~(
                         or_(*transfer_actionable_parts)
                         if transfer_actionable_parts
@@ -779,9 +775,6 @@ class TodoService:
                 and_(
                     AssetScrap.applicant_id == user_id,
                     AssetScrap.status.in_(SCRAP_ACTIVE_STATUSES),
-                    self._asset_domain_condition(
-                        AssetScrap.asset_id, context, "scrap"
-                    ),
                     ~(
                         or_(*scrap_actionable_parts)
                         if scrap_actionable_parts
@@ -865,9 +858,6 @@ class TodoService:
                 and_(
                     AssetMaintenance.applicant_id == user_id,
                     AssetMaintenance.status.in_(MAINTENANCE_ACTIVE_STATUSES),
-                    self._asset_domain_condition(
-                        AssetMaintenance.asset_id, context, "maintenance"
-                    ),
                     ~(
                         or_(*maintenance_actionable_parts)
                         if maintenance_actionable_parts
@@ -898,7 +888,6 @@ class TodoService:
                 and_(
                     InventoryTask.created_by_id == user_id,
                     InventoryTask.status == InventoryStatus.IN_PROGRESS,
-                    self._inventory_domain_condition(context),
                     ~inventory_actionable,
                 ),
             )
@@ -925,7 +914,6 @@ class TodoService:
                 and_(
                     InventoryAdjustment.requested_by_id == user_id,
                     InventoryAdjustment.status == InventoryAdjustmentStatus.PENDING,
-                    self._inventory_domain_condition(context),
                     ~adjustment_actionable,
                 ),
             )
@@ -952,7 +940,6 @@ class TodoService:
                 and_(
                     AssetInbound.created_by_id == user_id,
                     AssetInbound.status == InboundStatus.PENDING,
-                    self._inbound_domain_condition(context),
                     ~inbound_actionable,
                 ),
             )
@@ -973,7 +960,6 @@ class TodoService:
                 AssetRequest.applicant_id == user_id,
                 Asset.custodian_id == user_id,
             ),
-            self._request_domain_condition(context),
             ~pending_return_exists,
         )
         branches.append(

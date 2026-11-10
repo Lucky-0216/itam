@@ -8,6 +8,7 @@ from app.api.v1 import (
     asset_ops,
     audit,
     auth,
+    branding,
     contracts,
     dashboard,
     dingtalk,
@@ -26,6 +27,7 @@ from app.api.v1 import (
 
 api_router = APIRouter()
 api_router.include_router(auth.router)
+api_router.include_router(branding.router)
 api_router.include_router(org.router)
 api_router.include_router(roles.router)
 api_router.include_router(asset_catalog.router)

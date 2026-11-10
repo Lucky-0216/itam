@@ -323,7 +323,7 @@ onMounted(() => {
   height: 34px;
   border-radius: 11px;
   background: var(--gradient-brand);
-  color: #fff;
+  color: var(--on-brand);
 }
 
 .total-copy {
@@ -375,7 +375,7 @@ onMounted(() => {
   border-color: var(--brand);
   color: var(--brand);
   background: var(--gradient-brand-soft);
-  box-shadow: 0 10px 24px -18px rgba(37, 99, 235, 0.9);
+  box-shadow: 0 10px 24px -18px var(--brand-glow);
 }
 
 .chip-count {
@@ -391,7 +391,7 @@ onMounted(() => {
 
 .category-chip.active .chip-count {
   background: var(--brand);
-  color: #fff;
+  color: var(--on-brand);
 }
 
 .category-chip.tone-cyan.active {
@@ -498,8 +498,8 @@ onMounted(() => {
 }
 
 .type-badge.tone-blue {
-  background: rgba(37, 99, 235, 0.1);
-  color: #2563eb;
+  background: var(--brand-soft);
+  color: var(--brand);
 }
 
 .type-badge.tone-cyan {

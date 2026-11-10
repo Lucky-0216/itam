@@ -6,6 +6,7 @@ import * as echarts from 'echarts/core'
 import type { EChartsCoreOption } from 'echarts/core'
 import {
   ArrowRight,
+  Bell,
   Box,
   DataAnalysis,
   Document,
@@ -25,6 +26,7 @@ import { dashboardApi } from '@/api/dashboard'
 import EChart from '@/components/charts/EChart.vue'
 import { useAppStore } from '@/stores/app'
 import { useAuthStore } from '@/stores/auth'
+import { useBrandingStore } from '@/stores/branding'
 import { useTodoStore } from '@/stores/todo'
 import {
   ASSET_STATUS_TAG_TYPES,
@@ -33,6 +35,7 @@ import {
 import type {
   CategorySlice,
   DashboardMetrics,
+  DashboardScope,
   DashboardSummary,
   DeptSlice,
   RecentAssetItem,
@@ -40,6 +43,7 @@ import type {
   TrendPoint,
   WarrantyItem,
 } from '@/types/dashboard'
+import type { Announcement } from '@/types/branding'
 import type { TodoCategoryGroup, TodoItem } from '@/types/todo'
 import { formatDateTime, greeting, todayLabel } from '@/utils/format'
 
@@ -73,22 +77,27 @@ const STATUS_COLORS: Record<string, string> = {
 const router = useRouter()
 const app = useAppStore()
 const auth = useAuthStore()
+const brandingStore = useBrandingStore()
 const todoStore = useTodoStore()
 
 const loading = ref(false)
 const failed = ref(false)
 const summary = ref<DashboardSummary | null>(null)
 const lastUpdated = ref('')
+const scope = ref<DashboardScope>('personal')
 const filters = reactive({
   dept_id: undefined as number | undefined,
   months: 12,
 })
 let summarySeq = 0
 
+const isPersonal = computed(() => scope.value === 'personal')
+
 const MONTH_OPTIONS = [
   { value: 3, label: '近 3 个月' },
   { value: 6, label: '近 6 个月' },
   { value: 12, label: '近 12 个月' },
+  { value: 0, label: '全部' },
 ]
 
 const deptOptions = computed(() =>
@@ -99,6 +108,14 @@ const deptOptions = computed(() =>
 )
 
 const displayName = computed(() => auth.profile?.real_name || auth.profile?.username || '用户')
+const announcements = computed<Announcement[]>(() => brandingStore.announcements)
+const welcomeText = computed(() => {
+  const template = brandingStore.branding.dashboard_welcome.trim()
+  if (!template) return ''
+  return template
+    .replaceAll('{name}', displayName.value)
+    .replaceAll('{greeting}', greeting())
+})
 const metrics = computed<DashboardMetrics>(() => summary.value?.metrics ?? EMPTY_METRICS)
 const statusDistribution = computed<StatusSlice[]>(() => summary.value?.status_distribution ?? [])
 const categoryDistribution = computed<CategorySlice[]>(
@@ -127,6 +144,16 @@ const maxDeptCount = computed(() =>
 const periodNew = computed(() => summary.value?.period.new_assets ?? 0)
 
 const canViewLedger = computed(() => auth.hasPerm('asset:ledger:view'))
+const canViewMine = computed(() => auth.hasPerm('asset:mine:view'))
+const canDrill = computed(() =>
+  isPersonal.value ? canViewMine.value : canViewLedger.value,
+)
+
+function drillTitle(label?: string | null): string | undefined {
+  if (!canDrill.value) return undefined
+  if (isPersonal.value) return '查看我的资产'
+  return label ? `查看「${label}」资产` : '查看资产'
+}
 const canViewAudit = computed(() => auth.hasPerm('system:audit:view'))
 const canViewCategories = computed(() => auth.hasPerm('asset:category:view'))
 
@@ -144,6 +171,14 @@ const todoGroups = computed<TodoCategoryGroup[]>(() =>
 
 function todoTone(category: string): string {
   return TODO_TONES[category] ?? 'blue'
+}
+
+function announcementTagType(
+  level: Announcement['level'],
+): 'primary' | 'warning' | 'danger' {
+  if (level === 'IMPORTANT') return 'danger'
+  if (level === 'WARNING') return 'warning'
+  return 'primary'
 }
 
 function todoStatusTag(
@@ -184,8 +219,10 @@ function cssVar(name: string, fallback: string): string {
 
 const chartPalette = computed(() => {
   const dark = app.isDark
+  const primaryName = app.primary
   return {
     dark,
+    primaryName,
     text2: cssVar('--text-2', '#5c6b83'),
     text3: cssVar('--text-3', '#93a0b4'),
     border: cssVar('--border', '#e5ebf4'),
@@ -211,11 +248,11 @@ function withAlpha(color: string, alpha: number): string {
 function tooltipStyle(): Record<string, unknown> {
   const palette = chartPalette.value
   return {
-    backgroundColor: palette.dark ? 'rgba(17, 27, 45, 0.96)' : 'rgba(255, 255, 255, 0.98)',
+    backgroundColor: cssVar('--el-bg-color-overlay', '#fdfdfe'),
     borderColor: palette.border,
     borderWidth: 1,
     padding: [8, 12],
-    textStyle: { color: palette.dark ? '#eaf0fb' : '#0f172a', fontSize: 12 },
+    textStyle: { color: cssVar('--text-1', '#1d2430'), fontSize: 12 },
     extraCssText:
       'border-radius:10px;box-shadow:0 14px 34px -20px rgba(15,23,42,0.45);',
   }
@@ -264,6 +301,7 @@ const statusOption = computed<EChartsCoreOption>(() => {
 const trendOption = computed<EChartsCoreOption>(() => {
   const palette = chartPalette.value
   const points = purchaseTrend.value
+  const yearly = points.length > 0 && points[0].month.length === 4
   return {
     grid: { left: 6, right: 16, top: 18, bottom: 2, containLabel: true },
     tooltip: {
@@ -278,10 +316,16 @@ const trendOption = computed<EChartsCoreOption>(() => {
     xAxis: {
       type: 'category',
       boundaryGap: false,
-      data: points.map((item) => `${Number(item.month.slice(5))}月`),
+      data: points.map((item) =>
+        yearly ? `${item.month}年` : `${Number(item.month.slice(5))}月`,
+      ),
       axisLine: { lineStyle: { color: palette.border } },
       axisTick: { show: false },
-      axisLabel: { color: palette.text3, fontSize: 10.5, interval: 1 },
+      axisLabel: {
+        color: palette.text3,
+        fontSize: 10.5,
+        interval: yearly ? (points.length > 12 ? 'auto' : 0) : 1,
+      },
     },
     yAxis: {
       type: 'value',
@@ -414,6 +458,7 @@ async function fetchSummary(): Promise<void> {
   loading.value = true
   try {
     const data = await dashboardApi.summary({
+      scope: scope.value,
       dept_id: filters.dept_id,
       months: filters.months,
     })
@@ -428,15 +473,25 @@ async function fetchSummary(): Promise<void> {
   }
 }
 
-watch(filters, () => {
+watch(scope, (value) => {
+  if (value === 'personal' && filters.dept_id !== undefined) {
+    filters.dept_id = undefined
+  }
+})
+
+watch([scope, filters], () => {
   void fetchSummary()
 })
 
 function openLedger(): void {
-  void router.push('/assets/ledger')
+  void router.push(isPersonal.value ? '/assets/mine' : '/assets/ledger')
 }
 
 function drillStatus(status: string): void {
+  if (isPersonal.value) {
+    if (canViewMine.value) void router.push('/assets/mine')
+    return
+  }
   if (!canViewLedger.value) return
   void router.push({ path: '/assets/ledger', query: { status } })
 }
@@ -446,6 +501,10 @@ function drillStatusItem(item: StatusSlice): void {
 }
 
 function drillCategory(categoryId: number | null | undefined): void {
+  if (isPersonal.value) {
+    if (canViewMine.value) void router.push('/assets/mine')
+    return
+  }
   if (!canViewLedger.value || !categoryId) return
   void router.push({
     path: '/assets/ledger',
@@ -454,6 +513,10 @@ function drillCategory(categoryId: number | null | undefined): void {
 }
 
 function drillDept(deptId: number | null | undefined): void {
+  if (isPersonal.value) {
+    if (canViewMine.value) void router.push('/assets/mine')
+    return
+  }
   if (!canViewLedger.value || !deptId) return
   void router.push({ path: '/assets/ledger', query: { dept_id: String(deptId) } })
 }
@@ -483,6 +546,7 @@ function openCategories(): void {
 
 onMounted(() => {
   todoStore.start()
+  void brandingStore.loadAnnouncements()
   void fetchSummary()
 })
 </script>
@@ -502,7 +566,12 @@ onMounted(() => {
       </div>
       <div class="header-actions">
         <div class="dashboard-filters">
+          <el-radio-group v-model="scope" class="filter-scope">
+            <el-radio-button value="personal">我的资产</el-radio-button>
+            <el-radio-button value="org">组织视角</el-radio-button>
+          </el-radio-group>
           <el-select
+            v-if="!isPersonal"
             v-model="filters.dept_id"
             class="filter-dept"
             placeholder="全部部门"
@@ -529,6 +598,29 @@ onMounted(() => {
       </div>
     </header>
 
+    <section v-if="welcomeText || announcements.length" class="welcome-strip">
+      <p v-if="welcomeText" class="welcome-text">{{ welcomeText }}</p>
+      <div v-if="announcements.length" class="announcement-list">
+        <article v-for="item in announcements" :key="item.id" class="announcement-item">
+          <el-tag
+            :type="announcementTagType(item.level)"
+            effect="light"
+            size="small"
+            class="announcement-tag"
+          >
+            {{ item.level_label }}
+          </el-tag>
+          <div class="announcement-body">
+            <strong>{{ item.title }}</strong>
+            <p>{{ item.content }}</p>
+          </div>
+          <span class="announcement-meta">
+            {{ item.end_at ? `至 ${formatDateTime(item.end_at)}` : '长期有效' }}
+          </span>
+        </article>
+      </div>
+    </section>
+
     <section v-if="failed && !summary" class="surface-card error-panel">
       <el-empty description="驾驶舱数据加载失败，请检查服务状态后重试">
         <el-button type="primary" :icon="Refresh" :loading="loading" @click="fetchSummary">
@@ -549,7 +641,9 @@ onMounted(() => {
             <span class="hero-currency">¥</span>
             <span class="hero-value">{{ formatAmount(metrics.total_value) }}</span>
           </div>
-          <p class="hero-caption">当前数据范围内资产总值</p>
+          <p class="hero-caption">
+            {{ isPersonal ? '我的资产总值' : '当前数据范围内资产总值' }}
+          </p>
 
           <div class="hero-pills">
             <span class="hero-pill"><strong>{{ metrics.total_assets }}</strong> 项资产</span>
@@ -561,12 +655,12 @@ onMounted(() => {
 
           <div class="hero-actions">
             <el-button
-              v-if="canViewLedger"
+              v-if="canDrill"
               type="primary"
               :icon="Monitor"
               @click="openLedger"
             >
-              进入资产台账
+              {{ isPersonal ? '进入我的资产' : '进入资产台账' }}
             </el-button>
             <el-button v-if="canViewAudit" class="ghost-btn" :icon="Document" @click="openAudit">
               审计日志
@@ -588,7 +682,7 @@ onMounted(() => {
             :percentage="inUseRate"
             :width="132"
             :stroke-width="10"
-            color="#38bdf8"
+            :color="chartPalette.cyan"
           >
             <template #default="{ percentage }">
               <span class="gauge-value">{{ percentage }}<small>%</small></span>
@@ -597,7 +691,10 @@ onMounted(() => {
           </el-progress>
           <p class="gauge-foot">在用 {{ metrics.in_use }} / 全部 {{ metrics.total_assets }}</p>
           <div class="gauge-mini">
-            <span><em>+{{ currentMonthNew }}</em> 本月新增</span>
+            <span>
+              <em>+{{ currentMonthNew }}</em>
+              {{ filters.months === 0 ? '本年新增' : '本月新增' }}
+            </span>
             <span><em>{{ metrics.pending_stock }}</em> 待入库</span>
           </div>
         </div>
@@ -648,7 +745,11 @@ onMounted(() => {
             <p class="metric-label">本月入库</p>
             <p class="metric-value">{{ formatAmount(metrics.month_inbound) }}</p>
             <p class="metric-foot">
-              近 {{ filters.months }} 个月合计 {{ summary?.period.inbound ?? 0 }}
+              {{
+                filters.months === 0
+                  ? `全部历史合计 ${summary?.period.inbound ?? 0}`
+                  : `近 ${filters.months} 个月合计 ${summary?.period.inbound ?? 0}`
+              }}
             </p>
           </div>
         </article>
@@ -659,7 +760,11 @@ onMounted(() => {
             <p class="metric-label">本月领用</p>
             <p class="metric-value">{{ formatAmount(metrics.month_requisition) }}</p>
             <p class="metric-foot">
-              近 {{ filters.months }} 个月 {{ summary?.period.requisition ?? 0 }} 单
+              {{
+                filters.months === 0
+                  ? `全部历史 ${summary?.period.requisition ?? 0} 单`
+                  : `近 ${filters.months} 个月 ${summary?.period.requisition ?? 0} 单`
+              }}
             </p>
           </div>
         </article>
@@ -779,8 +884,8 @@ onMounted(() => {
               <li
                 v-for="item in statusDistribution"
                 :key="item.status"
-                :class="{ clickable: canViewLedger && item.count > 0 }"
-                :title="canViewLedger && item.count > 0 ? `查看「${item.label}」资产` : undefined"
+                :class="{ clickable: canDrill && item.count > 0 }"
+                :title="item.count > 0 ? drillTitle(item.label) : undefined"
                 @click="drillStatusItem(item)"
               >
                 <span class="legend-dot" :style="{ background: statusColor(item.status) }" />
@@ -798,9 +903,13 @@ onMounted(() => {
           <header class="panel-header">
             <div>
               <p class="panel-eyebrow">PURCHASE TREND</p>
-              <h2 class="panel-title">近 12 个月购置趋势</h2>
+              <h2 class="panel-title">
+                {{ filters.months === 0 ? '历年购置趋势' : `近 ${filters.months} 个月购置趋势` }}
+              </h2>
             </div>
-            <span class="panel-meta">区间新增 {{ periodNew }} 项</span>
+            <span class="panel-meta">
+              {{ filters.months === 0 ? '累计新增' : '区间新增' }} {{ periodNew }} 项
+            </span>
           </header>
           <EChart :option="trendOption" height="262px" />
         </article>
@@ -831,7 +940,9 @@ onMounted(() => {
           <header class="panel-header">
             <div>
               <p class="panel-eyebrow">DEPARTMENT</p>
-              <h2 class="panel-title">部门资产持有</h2>
+              <h2 class="panel-title">
+                {{ isPersonal ? '我的资产部门分布' : '部门资产持有' }}
+              </h2>
             </div>
             <span class="panel-meta">Top 8</span>
           </header>
@@ -841,8 +952,8 @@ onMounted(() => {
               v-for="(dept, index) in deptDistribution"
               :key="dept.dept_id ?? dept.name"
               class="dept-item"
-              :class="{ clickable: canViewLedger && dept.dept_id }"
-              :title="canViewLedger && dept.dept_id ? `查看「${dept.name}」资产` : undefined"
+              :class="{ clickable: canDrill && dept.dept_id }"
+              :title="dept.dept_id ? drillTitle(dept.name) : undefined"
               @click="drillDept(dept.dept_id)"
             >
               <span class="dept-rank" :class="{ top: index < 3 }">
@@ -872,8 +983,8 @@ onMounted(() => {
               <p class="panel-eyebrow">WARRANTY ALERT</p>
               <h2 class="panel-title">保修临期提醒</h2>
             </div>
-            <el-button v-if="canViewLedger" link type="primary" @click="openLedger">
-              资产台账
+            <el-button v-if="canDrill" link type="primary" @click="openLedger">
+              {{ isPersonal ? '我的资产' : '资产台账' }}
               <el-icon><ArrowRight /></el-icon>
             </el-button>
           </header>
@@ -930,9 +1041,9 @@ onMounted(() => {
           <header class="panel-header">
             <div>
               <p class="panel-eyebrow">RECENT</p>
-              <h2 class="panel-title">最近入库</h2>
+              <h2 class="panel-title">{{ isPersonal ? '我的最近资产' : '最近入库' }}</h2>
             </div>
-            <el-button v-if="canViewLedger" link type="primary" @click="openLedger">
+            <el-button v-if="canDrill" link type="primary" @click="openLedger">
               查看全部
               <el-icon><ArrowRight /></el-icon>
             </el-button>
@@ -1015,6 +1126,75 @@ onMounted(() => {
   padding: 42px 24px;
 }
 
+.welcome-strip {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px 22px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background:
+    var(--gradient-brand-soft),
+    var(--surface);
+}
+
+.welcome-text {
+  color: var(--text-1);
+  font-size: 14.5px;
+  line-height: 1.7;
+}
+
+.announcement-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.announcement-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border);
+}
+
+.announcement-item:first-child {
+  padding-top: 0;
+  border-top: none;
+}
+
+.announcement-tag {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.announcement-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.announcement-body strong {
+  display: block;
+  color: var(--text-1);
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.announcement-body p {
+  margin-top: 3px;
+  color: var(--text-2);
+  font-size: 12.5px;
+  line-height: 1.65;
+  white-space: pre-line;
+}
+
+.announcement-meta {
+  flex-shrink: 0;
+  color: var(--text-3);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
 /* Hero */
 .overview-hero {
   position: relative;
@@ -1024,13 +1204,13 @@ onMounted(() => {
   gap: 28px;
   overflow: hidden;
   padding: 30px 36px;
-  border: 1px solid rgba(115, 158, 224, 0.14);
+  border: 1px solid var(--hero-border);
   border-radius: var(--radius-lg);
   background:
-    radial-gradient(720px 320px at 88% -10%, rgba(6, 182, 212, 0.22), transparent 62%),
-    radial-gradient(620px 320px at 0% 120%, rgba(37, 99, 235, 0.3), transparent 60%),
-    linear-gradient(118deg, #0b1830 0%, #0d1c38 52%, #0a2233 100%);
-  box-shadow: 0 30px 80px -46px rgba(8, 25, 55, 0.85);
+    radial-gradient(720px 320px at 88% -10%, var(--hero-glow-a), transparent 62%),
+    radial-gradient(620px 320px at 0% 120%, var(--hero-glow-b), transparent 60%),
+    var(--hero-base);
+  box-shadow: var(--hero-shadow);
 }
 
 .overview-hero.is-loading {
@@ -1049,7 +1229,7 @@ onMounted(() => {
   height: 300px;
   top: -150px;
   right: 16%;
-  background: rgba(56, 189, 248, 0.18);
+  background: var(--hero-glow-a);
 }
 
 .hero-glow-b {
@@ -1057,15 +1237,15 @@ onMounted(() => {
   height: 260px;
   bottom: -160px;
   left: 24%;
-  background: rgba(37, 99, 235, 0.24);
+  background: var(--hero-glow-b);
 }
 
 .hero-grid {
   position: absolute;
   inset: 0;
   background-image:
-    linear-gradient(rgba(148, 178, 224, 0.06) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(148, 178, 224, 0.06) 1px, transparent 1px);
+    linear-gradient(var(--hero-grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--hero-grid-line) 1px, transparent 1px);
   background-size: 46px 46px;
   mask-image: radial-gradient(ellipse 80% 120% at 70% 20%, #000 10%, transparent 72%);
   pointer-events: none;
@@ -1078,7 +1258,7 @@ onMounted(() => {
 }
 
 .hero-eyebrow {
-  color: #6ea8ff;
+  color: var(--hero-accent-ink);
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.22em;
@@ -1093,24 +1273,24 @@ onMounted(() => {
 }
 
 .hero-currency {
-  color: #7cc8ff;
+  color: var(--hero-accent-ink);
   font-family: var(--font-number);
   font-size: 24px;
   font-weight: 600;
 }
 
 .hero-value {
-  color: #f6f9ff;
+  color: var(--hero-text);
   font-family: var(--font-number);
   font-size: clamp(32px, 4.4vw, 48px);
   font-weight: 700;
   letter-spacing: -0.035em;
-  text-shadow: 0 12px 40px rgba(56, 189, 248, 0.25);
+  text-shadow: var(--hero-value-shadow);
 }
 
 .hero-caption {
   margin-top: 8px;
-  color: #8aa1c0;
+  color: var(--hero-muted);
   font-size: 12.5px;
 }
 
@@ -1126,29 +1306,29 @@ onMounted(() => {
   align-items: center;
   gap: 5px;
   padding: 6px 12px;
-  border: 1px solid rgba(140, 175, 226, 0.16);
+  border: 1px solid var(--hero-pill-border);
   border-radius: 999px;
-  background: rgba(120, 160, 220, 0.08);
-  color: #a8bdd8;
+  background: var(--hero-pill-bg);
+  color: var(--hero-pill-text);
   font-size: 11.5px;
   white-space: nowrap;
 }
 
 .hero-pill strong {
-  color: #edf4ff;
+  color: var(--hero-pill-strong);
   font-family: var(--font-number);
   font-size: 13px;
   font-weight: 700;
 }
 
 .hero-pill.pill-warning {
-  border-color: rgba(245, 158, 11, 0.28);
-  background: rgba(245, 158, 11, 0.1);
-  color: #fcd28d;
+  border-color: var(--hero-warn-border);
+  background: var(--hero-warn-bg);
+  color: var(--hero-warn-text);
 }
 
 .hero-pill.pill-warning strong {
-  color: #fde68a;
+  color: var(--hero-warn-strong);
 }
 
 .hero-actions {
@@ -1164,19 +1344,19 @@ onMounted(() => {
 }
 
 .hero-actions :deep(.el-button--primary) {
-  box-shadow: 0 14px 30px -16px rgba(37, 99, 235, 0.95);
+  box-shadow: 0 14px 30px -16px var(--brand-glow);
 }
 
 .hero-actions :deep(.ghost-btn) {
-  border-color: rgba(150, 180, 225, 0.2);
-  background: rgba(255, 255, 255, 0.05);
-  color: #d7e4f7;
+  border-color: var(--hero-ghost-border);
+  background: var(--hero-ghost-bg);
+  color: var(--hero-ghost-text);
 }
 
 .hero-actions :deep(.ghost-btn:hover) {
-  border-color: rgba(150, 180, 225, 0.4);
-  background: rgba(255, 255, 255, 0.09);
-  color: #fff;
+  border-color: var(--hero-ghost-hover-border);
+  background: var(--hero-ghost-hover-bg);
+  color: var(--hero-ghost-hover-text);
 }
 
 .hero-gauge {
@@ -1190,18 +1370,18 @@ onMounted(() => {
 }
 
 .hero-gauge :deep(.el-progress-circle__track) {
-  stroke: rgba(255, 255, 255, 0.12);
+  stroke: var(--hero-track);
 }
 
 .hero-gauge :deep(.el-progress__text) {
   display: flex;
   flex-direction: column;
   gap: 3px;
-  color: #f8fbff;
+  color: var(--hero-strong);
 }
 
 .gauge-value {
-  color: #f8fbff;
+  color: var(--hero-strong);
   font-family: var(--font-number);
   font-size: 26px;
   font-weight: 700;
@@ -1211,20 +1391,20 @@ onMounted(() => {
 
 .gauge-value small {
   margin-left: 1px;
-  color: #7dd3fc;
+  color: var(--hero-accent-ink);
   font-size: 12px;
   font-weight: 600;
 }
 
 .gauge-label {
-  color: #8ba3c2;
+  color: var(--hero-faint);
   font-size: 10.5px;
   letter-spacing: 0.08em;
 }
 
 .gauge-foot {
   margin-top: 10px;
-  color: #9fb3cd;
+  color: var(--hero-muted);
   font-size: 11.5px;
 }
 
@@ -1233,13 +1413,13 @@ onMounted(() => {
   gap: 16px;
   margin-top: 12px;
   padding-top: 12px;
-  border-top: 1px dashed rgba(140, 175, 226, 0.16);
-  color: #7f95b2;
+  border-top: 1px dashed var(--hero-divider);
+  color: var(--hero-faint);
   font-size: 10.5px;
 }
 
 .gauge-mini em {
-  color: #e2efff;
+  color: var(--hero-strong);
   font-family: var(--font-number);
   font-size: 12px;
   font-style: normal;
@@ -1274,13 +1454,13 @@ onMounted(() => {
 }
 
 .tone-blue {
-  background: rgba(37, 99, 235, 0.12);
-  color: #2563eb;
+  background: var(--brand-soft);
+  color: var(--brand);
 }
 
 .tone-cyan {
-  background: rgba(6, 182, 212, 0.12);
-  color: #0891b2;
+  background: color-mix(in srgb, var(--brand-cyan) 14%, transparent);
+  color: var(--brand-cyan);
 }
 
 .tone-violet {
@@ -1311,6 +1491,36 @@ onMounted(() => {
 .tone-slate {
   background: rgba(100, 116, 139, 0.12);
   color: #475569;
+}
+
+html.dark .metric-icon.tone-violet {
+  background: rgba(129, 140, 248, 0.16);
+  color: #a5b4fc;
+}
+
+html.dark .metric-icon.tone-amber {
+  background: rgba(245, 158, 11, 0.16);
+  color: #fbbf24;
+}
+
+html.dark .metric-icon.tone-emerald {
+  background: rgba(16, 185, 129, 0.16);
+  color: #34d399;
+}
+
+html.dark .metric-icon.tone-sky {
+  background: rgba(56, 189, 248, 0.16);
+  color: #38bdf8;
+}
+
+html.dark .metric-icon.tone-rose {
+  background: rgba(244, 63, 94, 0.16);
+  color: #fb7185;
+}
+
+html.dark .metric-icon.tone-slate {
+  background: rgba(148, 163, 184, 0.16);
+  color: #cbd5e1;
 }
 
 .metric-body {
@@ -1798,11 +2008,11 @@ onMounted(() => {
 }
 
 .todo-dot.tone-blue {
-  background: #2563eb;
+  background: var(--brand);
 }
 
 .todo-dot.tone-cyan {
-  background: #0891b2;
+  background: var(--brand-cyan);
 }
 
 .todo-dot.tone-violet {
@@ -1886,13 +2096,13 @@ onMounted(() => {
 }
 
 .todo-type.tone-blue {
-  background: rgba(37, 99, 235, 0.1);
-  color: #2563eb;
+  background: var(--brand-soft);
+  color: var(--brand);
 }
 
 .todo-type.tone-cyan {
-  background: rgba(6, 182, 212, 0.12);
-  color: #0891b2;
+  background: color-mix(in srgb, var(--brand-cyan) 14%, transparent);
+  color: var(--brand-cyan);
 }
 
 .todo-type.tone-violet {
@@ -1908,6 +2118,33 @@ onMounted(() => {
 .todo-type.tone-rose {
   background: rgba(225, 29, 72, 0.09);
   color: #e11d48;
+}
+
+html.dark .todo-type.tone-violet {
+  background: rgba(124, 58, 237, 0.2);
+  color: #c4b5fd;
+}
+
+html.dark .todo-type.tone-amber {
+  background: rgba(245, 158, 11, 0.18);
+  color: #fbbf24;
+}
+
+html.dark .todo-type.tone-rose {
+  background: rgba(225, 29, 72, 0.18);
+  color: #fb7185;
+}
+
+html.dark .todo-dot.tone-violet {
+  background: #a78bfa;
+}
+
+html.dark .todo-dot.tone-amber {
+  background: #fbbf24;
+}
+
+html.dark .todo-dot.tone-rose {
+  background: #fb7185;
 }
 
 .todo-time {

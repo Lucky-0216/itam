@@ -1,3 +1,5 @@
+export type DashboardScope = 'personal' | 'org'
+
 export interface DashboardMetrics {
   total_assets: number
   total_value: number
@@ -76,6 +78,7 @@ export interface DashboardDeptOption {
 }
 
 export interface DashboardSummary {
+  scope: DashboardScope
   metrics: DashboardMetrics
   status_distribution: StatusSlice[]
   category_distribution: CategorySlice[]

@@ -59,8 +59,8 @@ function goHome(): void {
   overflow: hidden;
   padding: 40px 20px;
   background:
-    radial-gradient(800px 420px at 80% 0%, rgba(37, 99, 235, 0.22), transparent 62%),
-    radial-gradient(700px 460px at 10% 100%, rgba(6, 182, 212, 0.14), transparent 60%),
+    radial-gradient(800px 420px at 80% 0%, color-mix(in srgb, var(--brand) 22%, transparent), transparent 62%),
+    radial-gradient(700px 460px at 10% 100%, color-mix(in srgb, var(--brand-cyan) 14%, transparent), transparent 60%),
     #070f1d;
 }
 
@@ -87,7 +87,7 @@ function goHome(): void {
   height: 380px;
   top: -140px;
   left: 16%;
-  background: rgba(37, 99, 235, 0.28);
+  background: color-mix(in srgb, var(--brand) 28%, transparent);
 }
 
 .nf-glow-b {
@@ -95,7 +95,7 @@ function goHome(): void {
   height: 320px;
   bottom: -140px;
   right: 12%;
-  background: rgba(6, 182, 212, 0.18);
+  background: color-mix(in srgb, var(--brand-cyan) 18%, transparent);
 }
 
 .notfound-content {
@@ -123,12 +123,12 @@ function goHome(): void {
   height: 40px;
   border-radius: 12px;
   background: var(--gradient-brand);
-  color: #fff;
+  color: var(--on-brand);
   font-family: var(--font-number);
   font-size: 15px;
   font-weight: 800;
   letter-spacing: -0.06em;
-  box-shadow: 0 14px 30px -12px rgba(37, 99, 235, 0.9);
+  box-shadow: 0 14px 30px -12px var(--brand-glow);
 }
 
 .nf-brand > div:last-child {
@@ -153,7 +153,7 @@ function goHome(): void {
 }
 
 .nf-eyebrow {
-  color: #6ea8ff;
+  color: var(--hero-accent);
   font-size: 10.5px;
   font-weight: 700;
   letter-spacing: 0.24em;
@@ -161,7 +161,7 @@ function goHome(): void {
 
 .nf-code {
   margin: 2px 0 -6px;
-  background: linear-gradient(120deg, #dbeafe 0%, #60a5fa 45%, #22d3ee 100%);
+  background: linear-gradient(120deg, color-mix(in srgb, var(--brand) 30%, #ffffff) 0%, var(--hero-accent) 45%, var(--brand-cyan) 100%);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
@@ -170,7 +170,7 @@ function goHome(): void {
   font-weight: 800;
   line-height: 1;
   letter-spacing: -0.07em;
-  filter: drop-shadow(0 24px 44px rgba(37, 99, 235, 0.32));
+  filter: drop-shadow(0 24px 44px var(--hero-glow-b));
 }
 
 .nf-title {

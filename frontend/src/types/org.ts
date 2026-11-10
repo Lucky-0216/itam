@@ -75,6 +75,42 @@ export interface UserPage {
   page_size: number
 }
 
+export type DeptSource = 'ldap' | 'dingtalk' | 'local'
+
+export interface DeptMember {
+  id: number
+  username: string
+  real_name: string
+  employee_no: string | null
+  position: string | null
+  source: string
+  status: number
+  is_manager: boolean
+}
+
+export interface DeptMemberPage {
+  items: DeptMember[]
+  total: number
+  page: number
+  page_size: number
+  manager: DeptMember | null
+}
+
+export interface DeptManagerPayload {
+  source: DeptSource
+  manager_id: number | null
+  version: number
+}
+
+export interface DeptManagerResult {
+  dept_id: number
+  dept_name: string
+  source: string
+  manager_id: number | null
+  manager_name: string | null
+  version: number
+}
+
 export interface UserQuery {
   page: number
   page_size: number

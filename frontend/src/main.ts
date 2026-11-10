@@ -11,6 +11,7 @@ import App from './App.vue'
 import router from './router'
 import { pinia } from './stores'
 import { useAppStore } from './stores/app'
+import { useBrandingStore } from './stores/branding'
 import { permissionDirective } from './directives/permission'
 
 const app = createApp(App)
@@ -27,5 +28,6 @@ app.directive('perm', permissionDirective)
 const appStore = useAppStore(pinia)
 appStore.applyTheme()
 appStore.applyMotion()
+void useBrandingStore(pinia).load()
 
 app.mount('#app')

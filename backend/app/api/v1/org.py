@@ -6,6 +6,7 @@ from app.core.database import get_db
 from app.core.response import ok
 from app.schemas.org import (
     DeptCreate,
+    DeptManagerUpdate,
     DeptUpdate,
     OrgSyncPolicyUpdate,
     ResetPasswordRequest,
@@ -13,6 +14,7 @@ from app.schemas.org import (
     UserStatusUpdate,
     UserUpdate,
 )
+from app.services.dept_manager_service import DeptManagerService
 from app.services.dept_service import DeptService
 from app.services.org_policy_service import OrgSyncPolicyService
 from app.services.permission_service import AuthContext
@@ -62,6 +64,53 @@ async def delete_department(
 ):
     await DeptService(session).delete(dept_id, context)
     return ok(None, message="部门已删除")
+
+
+@router.get("/dept-managers/tree", summary="部门负责人-按来源的部门树")
+async def dept_manager_tree(
+    source: str = Query(pattern=_SOURCE_PATTERN),
+    context: AuthContext = Depends(require_perm("system:dept-manager:view")),
+    session: AsyncSession = Depends(get_db),
+):
+    result = await DeptManagerService(session).tree(context, source)
+    return ok([item.model_dump(mode="json") for item in result])
+
+
+@router.get("/dept-managers/{dept_id}/users", summary="部门负责人-部门直属成员")
+async def dept_manager_members(
+    dept_id: int,
+    source: str = Query(pattern=_SOURCE_PATTERN),
+    keyword: str | None = Query(None, max_length=100),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+    context: AuthContext = Depends(require_perm("system:dept-manager:view")),
+    session: AsyncSession = Depends(get_db),
+):
+    result = await DeptManagerService(session).members(
+        context,
+        dept_id,
+        source=source,
+        keyword=keyword,
+        page=page,
+        page_size=page_size,
+    )
+    return ok(result.model_dump(mode="json"))
+
+
+@router.put("/dept-managers/{dept_id}", summary="指定或取消部门负责人")
+async def assign_dept_manager(
+    dept_id: int,
+    payload: DeptManagerUpdate,
+    context: AuthContext = Depends(require_perm("system:dept-manager:update")),
+    session: AsyncSession = Depends(get_db),
+):
+    result = await DeptManagerService(session).assign(dept_id, payload, context)
+    message = (
+        f"已指定 {result.manager_name} 为「{result.dept_name}」负责人"
+        if result.manager_id
+        else f"已取消「{result.dept_name}」负责人"
+    )
+    return ok(result.model_dump(mode="json"), message=message)
 
 
 @router.get("/users", summary="用户列表（分页、部门与数据范围过滤）")

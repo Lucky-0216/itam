@@ -1,7 +1,11 @@
 import { request } from '@/api/request'
 import type {
+  DeptManagerPayload,
+  DeptManagerResult,
+  DeptMemberPage,
   DeptNode,
   DeptPayload,
+  DeptSource,
   DeptUpdatePayload,
   OrgUserDetail,
   ResetPasswordPayload,
@@ -73,5 +77,30 @@ export const orgApi = {
 
   updateSyncPolicy(payload: SyncPolicyUpdate): Promise<SyncPolicy> {
     return request<SyncPolicy>({ url: '/sync-policy', method: 'put', data: payload })
+  },
+
+  deptManagerTree(source: DeptSource): Promise<DeptNode[]> {
+    return request<DeptNode[]>({ url: '/dept-managers/tree', params: { source } })
+  },
+
+  deptManagerMembers(
+    deptId: number,
+    params: { source: DeptSource; keyword?: string; page: number; page_size: number },
+  ): Promise<DeptMemberPage> {
+    return request<DeptMemberPage>({
+      url: `/dept-managers/${deptId}/users`,
+      params,
+    })
+  },
+
+  assignDeptManager(
+    deptId: number,
+    payload: DeptManagerPayload,
+  ): Promise<DeptManagerResult> {
+    return request<DeptManagerResult>({
+      url: `/dept-managers/${deptId}`,
+      method: 'put',
+      data: payload,
+    })
   },
 }

@@ -92,7 +92,7 @@ async function switchAccount(): Promise<void> {
 
 .code-foreground {
   position: relative;
-  background: linear-gradient(120deg, #93b4f4, var(--brand) 45%, #06b6d4);
+  background: linear-gradient(120deg, color-mix(in srgb, var(--brand) 45%, #ffffff), var(--brand) 45%, var(--brand-cyan));
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
@@ -109,8 +109,8 @@ async function switchAccount(): Promise<void> {
   border: 3px solid var(--surface);
   border-radius: 50%;
   background: var(--gradient-brand);
-  color: #fff;
-  box-shadow: 0 14px 30px -12px rgba(37, 99, 235, 0.8);
+  color: var(--on-brand);
+  box-shadow: 0 14px 30px -12px var(--brand-glow);
 }
 
 .lock-badge .el-icon {

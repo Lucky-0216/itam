@@ -81,6 +81,7 @@ class DashboardDeptOption(BaseModel):
 
 
 class DashboardSummaryOut(BaseModel):
+    scope: str
     metrics: DashboardMetrics
     status_distribution: list[StatusSlice]
     category_distribution: list[CategorySlice]

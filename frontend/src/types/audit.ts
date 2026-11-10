@@ -19,6 +19,8 @@ export interface AuditLogItem {
 export interface AuditLogDetail extends AuditLogItem {
   before_data: unknown
   after_data: unknown
+  before_labels?: Record<string, string> | null
+  after_labels?: Record<string, string> | null
 }
 
 export interface AuditLogPage {

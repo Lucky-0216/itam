@@ -54,7 +54,7 @@ const todoBadgeText = computed(() => (todoStore.total > 99 ? '99+' : String(todo
   margin-left: auto;
   border-radius: 999px;
   background: var(--brand);
-  color: #fff;
+  color: var(--on-brand);
   font-size: 10.5px;
   font-weight: 700;
   line-height: 1;

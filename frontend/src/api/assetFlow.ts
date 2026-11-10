@@ -7,6 +7,10 @@ import type {
   AssetRequestSummary,
   AvailableAsset,
   AvailableCategory,
+  DirectOutboundCategory,
+  DirectOutboundPayload,
+  DirectOutboundResult,
+  DirectOutboundUser,
   MyAssetItem,
   OutboundPayload,
   RequestCreatePayload,
@@ -145,5 +149,39 @@ export const assetFlowApi = {
 
   assetHistory(assetId: number): Promise<AssetHistoryItem[]> {
     return request<AssetHistoryItem[]>({ url: `/assets/${assetId}/history` })
+  },
+
+  directOutboundCategories(): Promise<DirectOutboundCategory[]> {
+    return request<DirectOutboundCategory[]>({
+      url: '/asset-direct-outbound/categories',
+    })
+  },
+
+  directOutboundAssets(params: {
+    keyword?: string
+    category_id?: number
+    include_child?: boolean
+    page: number
+    page_size: number
+  }): Promise<AvailableAssetPage> {
+    return request<AvailableAssetPage>({
+      url: '/asset-direct-outbound/assets',
+      params,
+    })
+  },
+
+  directOutboundUsers(keyword?: string): Promise<DirectOutboundUser[]> {
+    return request<DirectOutboundUser[]>({
+      url: '/asset-direct-outbound/users',
+      params: keyword ? { keyword } : undefined,
+    })
+  },
+
+  directOutbound(payload: DirectOutboundPayload): Promise<DirectOutboundResult> {
+    return request<DirectOutboundResult>({
+      url: '/asset-direct-outbound',
+      method: 'post',
+      data: payload,
+    })
   },
 }

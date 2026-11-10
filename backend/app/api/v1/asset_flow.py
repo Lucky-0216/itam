@@ -12,6 +12,7 @@ from app.schemas.asset_flow import (
     AssetRequestCreate,
     AssetReturnConfirmPayload,
     AssetReturnCreate,
+    DirectOutboundPayload,
 )
 from app.services.asset_flow_service import AssetFlowService
 from app.services.permission_service import AuthContext
@@ -237,6 +238,68 @@ async def update_approval_config(
         context=context,
     )
     return ok(result.model_dump(mode="json"), message="审批流程配置已更新")
+
+
+@router.get("/asset-direct-outbound/categories", summary="直接出库可选分类")
+async def direct_outbound_categories(
+    context: AuthContext = Depends(require_perm("asset:outbound:direct")),
+    session: AsyncSession = Depends(get_db),
+):
+    items = await AssetFlowService(session).direct_category_options(context)
+    return ok([item.model_dump(mode="json") for item in items])
+
+
+@router.get("/asset-direct-outbound/assets", summary="直接出库可选在库资产")
+async def direct_outbound_assets(
+    keyword: str | None = Query(None, max_length=100),
+    category_id: int | None = Query(None, ge=1),
+    include_child: bool = Query(True),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+    context: AuthContext = Depends(require_perm("asset:outbound:direct")),
+    session: AsyncSession = Depends(get_db),
+):
+    items, total = await AssetFlowService(session).direct_assets(
+        context,
+        keyword=keyword,
+        category_id=category_id,
+        include_child=include_child,
+        page=page,
+        page_size=page_size,
+    )
+    return ok(
+        {
+            "items": [item.model_dump(mode="json") for item in items],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
+    )
+
+
+@router.get("/asset-direct-outbound/users", summary="直接出库目标领用人")
+async def direct_outbound_users(
+    keyword: str | None = Query(None, max_length=100),
+    context: AuthContext = Depends(require_perm("asset:outbound:direct")),
+    session: AsyncSession = Depends(get_db),
+):
+    items = await AssetFlowService(session).direct_user_options(
+        context, keyword=keyword
+    )
+    return ok([item.model_dump(mode="json") for item in items])
+
+
+@router.post("/asset-direct-outbound", summary="管理员直接出库")
+async def direct_outbound(
+    payload: DirectOutboundPayload,
+    context: AuthContext = Depends(require_perm("asset:outbound:direct")),
+    session: AsyncSession = Depends(get_db),
+):
+    result = await AssetFlowService(session).direct_outbound(payload, context)
+    return ok(
+        result.model_dump(mode="json"),
+        message=f"已直接出库 {result.count} 台资产给 {result.user_name}",
+    )
 
 
 @router.get("/asset-requests/{request_id}", summary="业务单据详情")

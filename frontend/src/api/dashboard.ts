@@ -1,7 +1,8 @@
 import { request } from '@/api/request'
-import type { DashboardSummary } from '@/types/dashboard'
+import type { DashboardScope, DashboardSummary } from '@/types/dashboard'
 
 export interface DashboardQuery {
+  scope?: DashboardScope
   dept_id?: number
   months?: number
 }

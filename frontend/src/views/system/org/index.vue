@@ -1733,7 +1733,7 @@ onMounted(() => {
   flex-shrink: 0;
   border-radius: 10px;
   background: var(--gradient-brand);
-  color: #fff;
+  color: var(--on-brand);
   font-size: 11px;
   font-weight: 700;
   letter-spacing: -0.02em;
@@ -1914,7 +1914,7 @@ onMounted(() => {
   height: 38px;
   border-radius: 11px;
   background: var(--gradient-brand);
-  color: #fff;
+  color: var(--on-brand);
   font-size: 12px;
   font-weight: 700;
 }

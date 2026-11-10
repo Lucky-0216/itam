@@ -58,6 +58,16 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '资产领用确认', perm: 'asset:outbound:view', icon: 'Box' },
       },
       {
+        path: 'assets/direct-outbound',
+        name: 'AssetDirectOutbound',
+        component: () => import('@/views/assets/direct-outbound/index.vue'),
+        meta: {
+          title: '资产出库',
+          perm: 'asset:outbound:direct',
+          icon: 'Promotion',
+        },
+      },
+      {
         path: 'assets/returns',
         name: 'AssetReturnReview',
         component: () => import('@/views/assets/review/index.vue'),
@@ -124,6 +134,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '组织架构', perm: 'system:org:view', icon: 'OfficeBuilding' },
       },
       {
+        path: 'system/dept-managers',
+        name: 'SystemDeptManagers',
+        component: () => import('@/views/system/dept-managers/index.vue'),
+        meta: { title: '部门负责人', perm: 'system:dept-manager:view', icon: 'UserFilled' },
+      },
+      {
         path: 'system/roles',
         name: 'SystemRoles',
         component: () => import('@/views/system/roles/index.vue'),
@@ -158,6 +174,16 @@ const routes: RouteRecordRaw[] = [
         },
       },
       {
+        path: 'system/branding',
+        name: 'SystemBranding',
+        component: () => import('@/views/system/branding/index.vue'),
+        meta: {
+          title: '品牌与首页',
+          perm: 'system:settings:view',
+          icon: 'Brush',
+        },
+      },
+      {
         path: 'system/approval-flows',
         name: 'SystemApprovalFlows',
         component: () => import('@/views/system/approval-flows/index.vue'),
@@ -178,6 +204,12 @@ const routes: RouteRecordRaw[] = [
         name: 'ChangePassword',
         component: () => import('@/views/auth/ChangePassword.vue'),
         meta: { title: '修改密码' },
+      },
+      {
+        path: 'settings/appearance',
+        name: 'AppearanceSettings',
+        component: () => import('@/views/settings/appearance.vue'),
+        meta: { title: '外观设置' },
       },
       {
         path: '403',

@@ -39,6 +39,7 @@ from app.services.scope_service import (
 
 _TREND_MONTHS = 12
 _CONTRACT_REMINDER_DAYS = 30
+_ALL_HISTORY_START = datetime(1970, 1, 1)
 
 
 def _shift_month(year: int, month: int, delta: int) -> tuple[int, int]:
@@ -63,25 +64,44 @@ class DashboardService:
         *,
         dept_id: int | None = None,
         months: int = _TREND_MONTHS,
+        scope: str = "personal",
     ) -> DashboardSummaryOut:
-        if months not in (3, 6, 12):
+        if months not in (0, 3, 6, 12):
             months = _TREND_MONTHS
+        personal = scope != "org"
         today = now_cst().date()
         month_start = datetime(today.year, today.month, 1)
-        period_year, period_month = _shift_month(
-            today.year, today.month, -(months - 1)
-        )
-        period_start = datetime(period_year, period_month, 1)
+        if months:
+            period_year, period_month = _shift_month(
+                today.year, today.month, -(months - 1)
+            )
+            period_start = datetime(period_year, period_month, 1)
+        else:
+            period_start = _ALL_HISTORY_START
 
-        allowed_dept_ids = await self._dept_scope(context, dept_id)
-        conditions = await asset_scope_conditions(
-            self.session, context, resource="report"
-        )
-        if not is_self_only(context, "report") and allowed_dept_ids is not None:
-            if not allowed_dept_ids:
-                conditions.append(false())
-            else:
-                conditions.append(Asset.dept_id.in_(allowed_dept_ids))
+        allowed_dept_ids: set[int] | None = None
+        if personal:
+            conditions = [
+                Asset.deleted_at.is_(None),
+                Asset.custodian_id == context.user.id,
+                Asset.status.in_((AssetStatus.IN_USE, AssetStatus.BORROWED)),
+            ]
+            if dept_id is not None:
+                subtree = await self._dept_subtree(dept_id)
+                if not subtree:
+                    conditions.append(false())
+                else:
+                    conditions.append(Asset.dept_id.in_(subtree))
+        else:
+            allowed_dept_ids = await self._dept_scope(context, dept_id)
+            conditions = await asset_scope_conditions(
+                self.session, context, resource="report"
+            )
+            if not is_self_only(context, "report") and allowed_dept_ids is not None:
+                if not allowed_dept_ids:
+                    conditions.append(false())
+                else:
+                    conditions.append(Asset.dept_id.in_(allowed_dept_ids))
 
         status_rows = (
             await self.session.execute(
@@ -142,16 +162,20 @@ class DashboardService:
         purchase_trend = await self._purchase_trend(conditions, today, months)
         warranty_expiring = await self._warranty_expiring(conditions, today, context)
         recent_assets = await self._recent_assets(conditions, context)
-        dept_options = await self._dept_options(context)
+        dept_options = (
+            await self._personal_dept_options(context)
+            if personal
+            else await self._dept_options(context)
+        )
 
         month_inbound = await self._inbound_quantity(
-            context, allowed_dept_ids, month_start
+            context, allowed_dept_ids, month_start, personal=personal
         )
         month_requisition = await self._requisition_count(
-            context, allowed_dept_ids, month_start
+            context, allowed_dept_ids, month_start, personal=personal
         )
         contract_expiring = await self._contract_expiring_count(
-            context, allowed_dept_ids, today
+            context, allowed_dept_ids, today, personal=personal
         )
         idle_count = status_counts.get(AssetStatus.IDLE, 0)
         idle_rate = (
@@ -190,22 +214,28 @@ class DashboardService:
             purchase_trend=purchase_trend,
             warranty_expiring=warranty_expiring,
             recent_assets=recent_assets,
-            data_scope_label=DATA_SCOPE_LABELS.get(
-                context.effective_scope("report"), context.effective_scope("report")
+            data_scope_label=(
+                "我的资产"
+                if personal
+                else DATA_SCOPE_LABELS.get(
+                    context.effective_scope("report"),
+                    context.effective_scope("report"),
+                )
             ),
             period=DashboardPeriod(
                 months=months,
                 start_date=period_start.date(),
                 new_assets=period_new_assets,
                 inbound=await self._inbound_quantity(
-                    context, allowed_dept_ids, period_start
+                    context, allowed_dept_ids, period_start, personal=personal
                 ),
                 requisition=await self._requisition_count(
-                    context, allowed_dept_ids, period_start
+                    context, allowed_dept_ids, period_start, personal=personal
                 ),
             ),
             dept_options=dept_options,
             dept_id=dept_id,
+            scope="personal" if personal else "org",
         )
 
     async def _dept_scope(
@@ -226,6 +256,64 @@ class DashboardService:
         if allowed is None:
             return subtree
         return allowed & subtree
+
+    async def _dept_subtree(self, dept_id: int) -> set[int]:
+        depts = list((await self.session.execute(select(Dept))).scalars().all())
+        target = next((dept for dept in depts if dept.id == dept_id), None)
+        if target is None:
+            return set()
+        prefix = target.path or f"/{target.id}/"
+        return {dept.id for dept in depts if dept.path.startswith(prefix)}
+
+    async def _personal_dept_options(
+        self, context: AuthContext
+    ) -> list[DashboardDeptOption]:
+        asset_depts = set(
+            (
+                await self.session.execute(
+                    select(Asset.dept_id)
+                    .where(
+                        Asset.deleted_at.is_(None),
+                        Asset.custodian_id == context.user.id,
+                        Asset.dept_id.is_not(None),
+                        Asset.status.in_((AssetStatus.IN_USE, AssetStatus.BORROWED)),
+                    )
+                    .distinct()
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not asset_depts:
+            return []
+        depts = list(
+            (
+                await self.session.execute(
+                    select(Dept)
+                    .where(Dept.status == 1)
+                    .order_by(Dept.path, Dept.sort, Dept.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        by_id = {dept.id: dept for dept in depts}
+        selected = set(asset_depts)
+        for dept_id in list(selected):
+            dept = by_id.get(dept_id)
+            while dept is not None and dept.parent_id:
+                selected.add(dept.parent_id)
+                dept = by_id.get(dept.parent_id)
+        return [
+            DashboardDeptOption(
+                id=dept.id,
+                parent_id=dept.parent_id,
+                name=dept.name,
+                level=dept.level,
+            )
+            for dept in depts
+            if dept.id in selected
+        ]
 
     async def _dept_options(self, context: AuthContext) -> list[DashboardDeptOption]:
         allowed = await scoped_dept_ids(self.session, context, resource="report")
@@ -254,18 +342,22 @@ class DashboardService:
         context: AuthContext,
         allowed_dept_ids: set[int] | None,
         since: datetime,
+        *,
+        personal: bool = False,
     ) -> int:
         stmt = select(func.coalesce(func.sum(AssetInbound.total_quantity), 0)).where(
             AssetInbound.status == InboundStatus.COMPLETED,
             AssetInbound.confirmed_at.is_not(None),
             AssetInbound.confirmed_at >= since,
         )
-        if is_self_only(context, "report"):
+        if personal or is_self_only(context, "report"):
             stmt = stmt.where(AssetInbound.created_by_id == context.user.id)
         elif allowed_dept_ids is not None:
             if not allowed_dept_ids:
                 return 0
             stmt = stmt.where(AssetInbound.dept_id.in_(allowed_dept_ids))
+        if personal:
+            return int(await self.session.scalar(stmt) or 0)
         domains = context.allowed_domains("report")
         if domains is not None:
             stmt = stmt.where(
@@ -282,6 +374,8 @@ class DashboardService:
         context: AuthContext,
         allowed_dept_ids: set[int] | None,
         since: datetime,
+        *,
+        personal: bool = False,
     ) -> int:
         stmt = select(func.count(AssetRequest.id)).where(
             AssetRequest.request_type == RequestType.REQUISITION,
@@ -289,12 +383,14 @@ class DashboardService:
             AssetRequest.outbound_at.is_not(None),
             AssetRequest.outbound_at >= since,
         )
-        if is_self_only(context, "report"):
+        if personal or is_self_only(context, "report"):
             stmt = stmt.where(AssetRequest.applicant_id == context.user.id)
         elif allowed_dept_ids is not None:
             if not allowed_dept_ids:
                 return 0
             stmt = stmt.where(AssetRequest.applicant_dept_id.in_(allowed_dept_ids))
+        if personal:
+            return int(await self.session.scalar(stmt) or 0)
         domains = context.allowed_domains("report")
         if domains is not None:
             stmt = stmt.where(
@@ -311,13 +407,15 @@ class DashboardService:
         context: AuthContext,
         allowed_dept_ids: set[int] | None,
         today: date,
+        *,
+        personal: bool = False,
     ) -> int:
         stmt = select(func.count(AssetContract.id)).where(
             AssetContract.terminated_at.is_(None),
             AssetContract.end_date >= today,
             AssetContract.end_date <= today + timedelta(days=_CONTRACT_REMINDER_DAYS),
         )
-        if is_self_only(context, "report"):
+        if personal or is_self_only(context, "report"):
             stmt = stmt.where(
                 or_(
                     AssetContract.owner_id == context.user.id,
@@ -328,6 +426,8 @@ class DashboardService:
             if not allowed_dept_ids:
                 return 0
             stmt = stmt.where(AssetContract.dept_id.in_(allowed_dept_ids))
+        if personal:
+            return int(await self.session.scalar(stmt) or 0)
         domains = context.allowed_domains("report")
         if domains is not None:
             stmt = stmt.where(
@@ -404,6 +504,30 @@ class DashboardService:
         today: date,
         months: int,
     ) -> list[TrendPoint]:
+        if months == 0:
+            rows = (
+                (
+                    await self.session.execute(
+                        select(Asset.purchase_date).where(
+                            *conditions,
+                            Asset.purchase_date.is_not(None),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if not rows:
+                return [TrendPoint(month=f"{today.year:04d}", count=0)]
+            counts: dict[int, int] = {}
+            for purchase_date in rows:
+                counts[purchase_date.year] = counts.get(purchase_date.year, 0) + 1
+            last_year = max(today.year, max(counts))
+            return [
+                TrendPoint(month=f"{year:04d}", count=counts.get(year, 0))
+                for year in range(min(counts), last_year + 1)
+            ]
+
         sequence = _month_sequence(today, months)
         start_year, start_month = sequence[0]
         start_date = date(start_year, start_month, 1)

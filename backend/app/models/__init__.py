@@ -49,8 +49,10 @@ from app.models.rbac import (
     role_menus,
     user_roles,
 )
+from app.models.settings import Announcement, SysSetting
 
 __all__ = [
+    "Announcement",
     "ApprovalFlow",
     "ApprovalFlowNode",
     "ApprovalTask",
@@ -93,6 +95,7 @@ __all__ = [
     "RoleDataPermission",
     "RoleDomain",
     "RoleFieldPermission",
+    "SysSetting",
     "User",
     "role_depts",
     "role_menus",

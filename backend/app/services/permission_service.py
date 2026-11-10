@@ -180,16 +180,25 @@ class PermissionService:
         is_superuser: bool,
         all_domain_codes: list[str],
     ) -> tuple[str, tuple[str, ...]]:
-        if is_superuser or any(role.domain_scope == DomainScope.ALL for role in roles):
+        if is_superuser:
             return DomainScope.ALL, tuple(all_domain_codes)
-        domains = sorted(
-            {
-                grant.domain.code
-                for role in roles
-                for grant in role.domain_grants
-            }
-        )
-        return DomainScope.CUSTOM, tuple(domains)
+        if not roles:
+            return DomainScope.CUSTOM, ()
+        # 只要任一角色显式指定了资产域，就按指定域并集限制；
+        # 通用角色（如默认的普通员工）的“全部资产域”不再放宽已指定的限制。
+        custom_roles = [
+            role for role in roles if role.domain_scope == DomainScope.CUSTOM
+        ]
+        if custom_roles:
+            domains = sorted(
+                {
+                    grant.domain.code
+                    for role in custom_roles
+                    for grant in role.domain_grants
+                }
+            )
+            return DomainScope.CUSTOM, tuple(domains)
+        return DomainScope.ALL, tuple(all_domain_codes)
 
     @staticmethod
     def _resolve_resource_permissions(

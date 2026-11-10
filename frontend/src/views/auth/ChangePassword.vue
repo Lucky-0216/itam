@@ -310,7 +310,7 @@ function goBack(): void {
   align-items: flex-start;
   gap: 14px;
   padding: 20px 18px;
-  border: 1px solid rgba(37, 99, 235, 0.2);
+  border: 1px solid color-mix(in srgb, var(--brand) 28%, transparent);
   border-radius: 14px;
   background: var(--gradient-brand-soft);
 }

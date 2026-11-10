@@ -53,6 +53,7 @@ async def test_menu_groups_and_employee_visibility(client: AsyncClient):
     assert [node["name"] for node in roots["资产生命周期"]["children"]] == [
         "资产台账",
         "资产入库",
+        "资产出库",
         "资产领用确认",
         "资产归还确认",
         "资产调拨",

@@ -1,5 +1,6 @@
 import re
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -70,6 +71,42 @@ class DeptOut(BaseModel):
 
 
 DeptOut.model_rebuild()
+
+DeptSource = Literal["ldap", "dingtalk", "local"]
+
+
+class DeptManagerUpdate(BaseModel):
+    source: DeptSource
+    manager_id: int | None = Field(default=None, gt=0)
+    version: int = Field(ge=1)
+
+
+class DeptMemberOut(BaseModel):
+    id: int
+    username: str
+    real_name: str
+    employee_no: str | None = None
+    position: str | None = None
+    source: str
+    status: int
+    is_manager: bool = False
+
+
+class DeptMemberPageOut(BaseModel):
+    items: list[DeptMemberOut]
+    total: int
+    page: int
+    page_size: int
+    manager: DeptMemberOut | None = None
+
+
+class DeptManagerResultOut(BaseModel):
+    dept_id: int
+    dept_name: str
+    source: str
+    manager_id: int | None = None
+    manager_name: str | None = None
+    version: int
 
 
 class UserCreate(BaseModel):

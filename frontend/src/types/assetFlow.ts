@@ -36,6 +36,55 @@ export interface AvailableAsset {
   version: number
 }
 
+export interface DirectOutboundCategory {
+  id: number
+  name: string
+  full_name: string
+}
+
+export interface DirectOutboundUser {
+  id: number
+  username: string
+  real_name: string
+  dept_name: string | null
+  status: number
+}
+
+export interface DirectOutboundItemPayload {
+  asset_id: number
+  version: number
+}
+
+export interface DirectOutboundPayload {
+  user_id: number
+  request_type: 'REQUISITION' | 'BORROW'
+  reason: string
+  location?: string | null
+  expected_return_date?: string | null
+  comment?: string | null
+  items: DirectOutboundItemPayload[]
+}
+
+export interface DirectOutboundItem {
+  asset_id: number
+  asset_no: string
+  name: string
+  status: AssetStatus
+  status_label: string
+  custodian_id: number | null
+  custodian_name: string | null
+  request_id: number | null
+}
+
+export interface DirectOutboundResult {
+  user_id: number
+  user_name: string
+  request_type: 'REQUISITION' | 'BORROW'
+  request_type_label: string
+  count: number
+  items: DirectOutboundItem[]
+}
+
 export type ApprovalStage = 'DEPT' | 'ASSET'
 
 export type ApprovalTaskStatus = 'PENDING' | 'WAITING' | 'APPROVED' | 'REJECTED' | 'SKIPPED'

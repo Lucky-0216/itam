@@ -27,6 +27,8 @@ class AuditLogItem(BaseModel):
 class AuditLogDetail(AuditLogItem):
     before_data: Any | None = None
     after_data: Any | None = None
+    before_labels: dict[str, str] | None = None
+    after_labels: dict[str, str] | None = None
 
 
 class AuditLogPage(BaseModel):

@@ -96,6 +96,82 @@ class AssetOutboundPayload(BaseModel):
         return _blank_to_none(value)
 
 
+class DirectOutboundItemPayload(BaseModel):
+    asset_id: int = Field(gt=0)
+    version: int = Field(ge=1)
+
+
+class DirectOutboundPayload(BaseModel):
+    user_id: int = Field(gt=0)
+    request_type: Literal["REQUISITION", "BORROW"] = "REQUISITION"
+    reason: str = Field(max_length=500)
+    location: str | None = Field(default=None, max_length=120)
+    expected_return_date: date | None = None
+    comment: str | None = Field(default=None, max_length=500)
+    items: list[DirectOutboundItemPayload] = Field(min_length=1, max_length=50)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def check_reason(cls, value: object) -> object:
+        if isinstance(value, str):
+            value = value.strip()
+        if not value:
+            raise ValueError("请填写出库原因")
+        return value
+
+    @field_validator("location", "comment", mode="before")
+    @classmethod
+    def trim_text(cls, value: object) -> object:
+        return _blank_to_none(value)
+
+    @model_validator(mode="after")
+    def check_items_and_borrow_date(self) -> "DirectOutboundPayload":
+        asset_ids = [item.asset_id for item in self.items]
+        if len(set(asset_ids)) != len(asset_ids):
+            raise ValueError("请勿重复选择同一资产")
+        if self.request_type == RequestType.BORROW:
+            if self.expected_return_date is None:
+                raise ValueError("借用出库必须填写预计归还日期")
+            if self.expected_return_date < date.today():
+                raise ValueError("预计归还日期不能早于今天")
+        return self
+
+
+class DirectCategoryOut(BaseModel):
+    id: int
+    name: str
+    full_name: str
+
+
+class DirectUserOut(BaseModel):
+    id: int
+    username: str
+    real_name: str
+    dept_name: str | None = None
+    status: int
+
+
+class DirectOutboundItemOut(BaseModel):
+    asset_id: int
+    asset_no: str
+    name: str
+    status: str
+    status_label: str
+    custodian_id: int | None = None
+    custodian_name: str | None = None
+    request_id: int | None = None
+
+
+class DirectOutboundResultOut(BaseModel):
+    user_id: int
+    user_name: str
+    request_type: str
+    request_type_label: str
+    count: int
+    items: list[DirectOutboundItemOut] = Field(default_factory=list)
+
+
+
 class AssetReturnCreate(BaseModel):
     asset_id: int = Field(gt=0)
     reason: str | None = Field(default=None, max_length=500)

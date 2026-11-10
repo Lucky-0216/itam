@@ -19,6 +19,8 @@ interface ChangedRow {
   field: string
   before: string
   after: string
+  beforeRaw: string | null
+  afterRaw: string | null
 }
 
 const FIELD_LABELS: Record<string, string> = {
@@ -36,6 +38,22 @@ const FIELD_LABELS: Record<string, string> = {
   level: '层级',
   dept_id: '所属部门',
   custodian_id: '责任人',
+  user_id: '用户',
+  user_ids: '人员',
+  owner_id: '负责人',
+  manager_id: '部门负责人',
+  applicant_id: '申请人',
+  created_by_id: '创建人',
+  updated_by_id: '更新人',
+  from_custodian_id: '原责任人',
+  to_custodian_id: '目标责任人',
+  from_dept_id: '原部门',
+  to_dept_id: '目标部门',
+  category_id: '资产分类',
+  model_id: '型号',
+  asset_id: '资产',
+  asset_ids: '资产列表',
+  asset_status: '资产状态',
   location: '存放位置',
   purchase_price: '采购价格',
   purchase_date: '购置日期',
@@ -191,6 +209,21 @@ function formatJson(value: unknown): string {
   return JSON.stringify(value, null, 2)
 }
 
+function formatSnapshot(value: unknown, labels?: Record<string, string> | null): string {
+  const text = formatJson(value)
+  if (!labels || value === null || value === undefined) return text
+  return text
+    .split('\n')
+    .map((line) => {
+      const match = /^  "([^"]+)":/.exec(line)
+      const label = match ? labels[match[1]] : undefined
+      const trimmed = line.trimEnd()
+      if (!label || trimmed.endsWith('{') || trimmed.endsWith('[')) return line
+      return `${line}  // ${label}`
+    })
+    .join('\n')
+}
+
 function fieldLabel(field: string): string {
   const label = FIELD_LABELS[field]
   return label ? `${label}（${field}）` : field
@@ -200,14 +233,24 @@ const changedRows = computed<ChangedRow[]>(() => {
   const log = detailLog.value
   const before = log && isRecord(log.before_data) ? log.before_data : {}
   const after = log && isRecord(log.after_data) ? log.after_data : {}
+  const beforeLabels = log?.before_labels ?? {}
+  const afterLabels = log?.after_labels ?? {}
   const keys = Array.from(new Set([...Object.keys(before), ...Object.keys(after)])).sort()
   return keys
     .filter((key) => JSON.stringify(before[key]) !== JSON.stringify(after[key]))
-    .map((key) => ({
-      field: fieldLabel(key),
-      before: displayValue(before[key]),
-      after: displayValue(after[key]),
-    }))
+    .map((key) => {
+      const beforeRaw = displayValue(before[key])
+      const afterRaw = displayValue(after[key])
+      const beforeLabel = beforeLabels[key]
+      const afterLabel = afterLabels[key]
+      return {
+        field: fieldLabel(key),
+        before: beforeLabel ?? beforeRaw,
+        after: afterLabel ?? afterRaw,
+        beforeRaw: beforeLabel ? beforeRaw : null,
+        afterRaw: afterLabel ? afterRaw : null,
+      }
+    })
 })
 
 onMounted(() => {
@@ -477,12 +520,18 @@ onMounted(() => {
               <el-table-column prop="field" label="字段" width="180" />
               <el-table-column label="变更前">
                 <template #default="{ row }">
-                  <span class="diff-before">{{ row.before }}</span>
+                  <div class="diff-cell">
+                    <span class="diff-before">{{ row.before }}</span>
+                    <small v-if="row.beforeRaw" class="diff-raw">{{ row.beforeRaw }}</small>
+                  </div>
                 </template>
               </el-table-column>
               <el-table-column label="变更后">
                 <template #default="{ row }">
-                  <span class="diff-after">{{ row.after }}</span>
+                  <div class="diff-cell">
+                    <span class="diff-after">{{ row.after }}</span>
+                    <small v-if="row.afterRaw" class="diff-raw">{{ row.afterRaw }}</small>
+                  </div>
                 </template>
               </el-table-column>
             </el-table>
@@ -494,12 +543,17 @@ onMounted(() => {
             class="detail-section"
           >
             <h4>原始快照</h4>
+            <p class="snapshot-hint">ID 字段已用注释标注名称，数值仍保持原始记录。</p>
             <el-collapse>
               <el-collapse-item title="变更前 (before)" name="before">
-                <pre class="json-block">{{ formatJson(detailLog.before_data) }}</pre>
+                <pre class="json-block">{{
+                  formatSnapshot(detailLog.before_data, detailLog.before_labels)
+                }}</pre>
               </el-collapse-item>
               <el-collapse-item title="变更后 (after)" name="after">
-                <pre class="json-block">{{ formatJson(detailLog.after_data) }}</pre>
+                <pre class="json-block">{{
+                  formatSnapshot(detailLog.after_data, detailLog.after_labels)
+                }}</pre>
               </el-collapse-item>
             </el-collapse>
           </div>
@@ -704,6 +758,12 @@ onMounted(() => {
   color: var(--text-1);
 }
 
+.snapshot-hint {
+  margin: -4px 0 10px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
 .diff-table {
   width: 100%;
 }
@@ -717,6 +777,19 @@ onMounted(() => {
 .diff-after {
   color: var(--text-1);
   font-weight: 600;
+}
+
+.diff-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.diff-raw {
+  font-family: var(--font-number);
+  font-size: 11px;
+  color: var(--text-3);
+  text-decoration: none;
 }
 
 .detail-empty {
